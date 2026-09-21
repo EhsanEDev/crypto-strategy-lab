@@ -1,0 +1,47 @@
+# Default research configuration - Milestone 1 baseline.
+# Thresholds are deliberately explicit (never hard-coded in the code).
+
+assets:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+
+timeframes:
+  - 1h
+  - 4h
+  - 1d
+
+# The v001 regime detector operates on this timeframe only.
+regime_timeframe: 4h
+
+# "futures" -> deep paginated history (public endpoint, no key needed)
+# "spot"    -> latest 201 candles only (Bitunix spot kline has no pagination)
+default_market: futures
+
+# Earliest date Bitunix serves 4h futures history for (discovered via API).
+default_start: "2022-04-17"
+
+exchange:
+  spot_base_url: https://openapi.bitunix.com
+  futures_base_url: https://fapi.bitunix.com
+  timeout_seconds: 30.0
+  max_retries: 3
+  retry_backoff_seconds: 1.5
+  page_delay_seconds: 0.25
+
+regime:
+  ema_fast: 50
+  ema_slow: 200
+
+  adx_period: 14
+  adx_trend_threshold: 20
+
+  atr_period: 14
+  rsi_period: 14
+
+  volatility_percentile: 90
+  volatility_lookback: 200
+
+  range_volatility_percentile: 80
+
+  slope_lookback: 5
