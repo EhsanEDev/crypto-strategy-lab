@@ -100,8 +100,14 @@ def build_report(
     regimes_metadata: dict[str, Any] | None = None,
     freshness: FreshnessStatus | None = None,
     regime_config_fingerprint: str | None = None,
+    market: str | None = None,
 ) -> str:
-    """Render the markdown report for one asset/timeframe."""
+    """Render the markdown report for one asset/timeframe.
+
+    ``market`` is the exact market of the raw/processed artifacts backing
+    this report; it is displayed as-is (no defaults) and cross-checked
+    against artifact metadata when present.
+    """
     validation = validate_ohlcv(raw, timeframe)
     ind_summary = _indicator_summary(regimes, config)
     raw_metadata = raw_metadata or {}
@@ -142,8 +148,11 @@ def build_report(
 
     lines.append("## Provenance & freshness")
     lines.append("")
-    lines.append(f"- Exchange: `{raw_metadata.get('exchange', 'bitunix')}` "
-                 f"| market: `{raw_metadata.get('market', '?')}`")
+    exchange = raw_metadata.get("exchange", (regimes_metadata or {}).get("exchange", "bitunix"))
+    resolved_market = market or raw_metadata.get("market") or (regimes_metadata or {}).get("market")
+    if resolved_market is None:
+        resolved_market = "unverified"  # never guess a market
+    lines.append(f"- Exchange: `{exchange}` | market: **`{resolved_market}`**")
     lines.append(f"- Raw range: `{raw_metadata.get('start', '?')}` → `{raw_metadata.get('end', '?')}` "
                  f"({raw_metadata.get('rows', '?')} candles)")
     lines.append(f"- Raw content hash: `{raw_metadata.get('raw_content_hash', 'n/a')[:16]}…`")
@@ -242,14 +251,14 @@ def write_regime_report(
     timeframe: str,
     raw: pd.DataFrame,
     regimes: pd.DataFrame,
+    market: str,
     regime_config: RegimeConfig | None = None,
     fingerprint: str | None = None,
     raw_metadata: dict[str, Any] | None = None,
     regimes_metadata: dict[str, Any] | None = None,
     freshness: FreshnessStatus | None = None,
-    market: str = "futures",
 ) -> Path:
-    """Render and write ``reports/{SYMBOL}_{timeframe}_regime_report.md``."""
+    """Render and write ``reports/{SYMBOL}_{timeframe}_{market}_regime_report.md``."""
     regime_config = regime_config or config.regime
     stats = compute_regime_stats(regimes)
     if raw_metadata is None:
@@ -265,8 +274,9 @@ def write_regime_report(
         regimes_metadata=regimes_metadata,
         freshness=freshness,
         regime_config_fingerprint=fingerprint,
+        market=market,
     )
-    path = reports_dir(config) / f"{symbol.upper()}_{timeframe}_regime_report.md"
+    path = reports_dir(config) / f"{symbol.upper()}_{timeframe}_{market}_regime_report.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(markdown, encoding="utf-8")
     logger.info("Report written: %s", path)

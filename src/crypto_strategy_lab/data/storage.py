@@ -4,15 +4,16 @@ Layout (Milestone 1)::
 
     data/
         raw/
-            bitunix/
-                BTCUSDT/1h.parquet, 4h.parquet, 1d.parquet
-                ...
+            bitunix/{market}/SYMBOL/{timeframe}.parquet
         processed/
-            BTCUSDT/4h_indicators.parquet, 4h_regimes.parquet
-            ...
+            bitunix/{market}/SYMBOL/{timeframe}_{indicators,regimes}.parquet
         metadata/
-            raw/{exchange}/{SYMBOL}_{timeframe}.json
-            processed/{SYMBOL}_{timeframe}_{artifact}.json
+            raw/{exchange}/{market}/{SYMBOL}_{timeframe}.json
+            processed/{exchange}/{market}/{SYMBOL}_{timeframe}_{artifact}.json
+
+Spot and Futures are different instruments: raw AND processed artifacts
+are always market-namespaced, so a Spot pipeline can never overwrite or
+mislabel Futures research artifacts (or vice versa).
 
 Rules:
 
@@ -29,7 +30,11 @@ Rules:
   successful run rewrites both.
 * Every artifact gets a JSON metadata sidecar for reproducibility, and
   processed artifacts record the content hash of the raw dataset they were
-  generated from (freshness proof).
+  generated from plus the market it came from (freshness proof).
+* Legacy marketless processed artifacts (pre-market-namespace layout) are
+  never treated as trustworthy: they are detected and must be regenerated
+  (the old layout does not record which market produced them, so guessing
+  is not an option).
 """
 
 from __future__ import annotations
@@ -71,8 +76,9 @@ def raw_root(config: LabConfig, exchange: str, market: str = "futures") -> Path:
     return cfg_data_dir(config) / "raw" / exchange / market
 
 
-def processed_root(config: LabConfig) -> Path:
-    return cfg_data_dir(config) / "processed"
+def processed_root(config: LabConfig, exchange: str, market: str) -> Path:
+    """Processed storage root, namespaced by exchange and market."""
+    return cfg_data_dir(config) / "processed" / exchange / market
 
 
 def metadata_root(config: LabConfig) -> Path:
@@ -85,12 +91,16 @@ def raw_candles_path(
     return raw_root(config, exchange, market) / symbol.upper() / f"{timeframe}.parquet"
 
 
-def processed_indicators_path(config: LabConfig, symbol: str, timeframe: str) -> Path:
-    return processed_root(config) / symbol.upper() / f"{timeframe}_indicators.parquet"
-
-
-def processed_regimes_path(config: LabConfig, symbol: str, timeframe: str) -> Path:
-    return processed_root(config) / symbol.upper() / f"{timeframe}_regimes.parquet"
+def processed_path(
+    config: LabConfig, artifact: str, exchange: str, market: str, symbol: str, timeframe: str
+) -> Path:
+    if artifact not in ("indicators", "regimes"):
+        raise StorageError(f"unknown artifact {artifact!r}")
+    return (
+        processed_root(config, exchange, market)
+        / symbol.upper()
+        / f"{timeframe}_{artifact}.parquet"
+    )
 
 
 def merge_raw_candles(
@@ -184,28 +194,29 @@ def load_raw_candles(
 def save_processed(
     config: LabConfig,
     artifact: str,  # "indicators" | "regimes"
+    exchange: str,
+    market: str,
     symbol: str,
     timeframe: str,
     df: pd.DataFrame,
     raw_df: pd.DataFrame,
     extra_metadata: dict[str, Any] | None = None,
 ) -> Path:
-    """Persist a processed artifact with full provenance metadata."""
+    """Persist a market-namespaced processed artifact with full provenance."""
     from .. import __version__
 
     symbol = symbol.upper()
-    if artifact == "indicators":
-        path = processed_indicators_path(config, symbol, timeframe)
-    elif artifact == "regimes":
-        path = processed_regimes_path(config, symbol, timeframe)
-    else:
+    if artifact not in ("indicators", "regimes"):
         raise StorageError(f"unknown artifact {artifact!r}")
     if df.empty:
         raise StorageError("refusing to store empty processed dataset")
 
+    path = processed_path(config, artifact, exchange, market, symbol, timeframe)
     write_parquet_atomic(df, path)
     metadata = {
         "artifact": artifact,
+        "exchange": exchange,
+        "market": market,
         "symbol": symbol,
         "timeframe": timeframe,
         "start": str(df.index.min()),
@@ -217,7 +228,8 @@ def save_processed(
         "code_version": __version__,
         # provenance / freshness proof
         "source": {
-            "exchange": "bitunix",
+            "exchange": exchange,
+            "market": market,
             "raw_content_hash": raw_content_hash(raw_df),
             "raw_rows": int(len(raw_df)),
             "raw_start": str(raw_df.index.min()),
@@ -228,20 +240,19 @@ def save_processed(
     if extra_metadata:
         metadata.update(extra_metadata)
     write_metadata(
-        metadata_root(config) / "processed" / f"{symbol}_{timeframe}_{artifact}.json", metadata
+        metadata_root(config)
+        / "processed" / exchange / market / f"{symbol}_{timeframe}_{artifact}.json",
+        metadata,
     )
     return path
 
 
 def load_processed(
-    config: LabConfig, artifact: str, symbol: str, timeframe: str
+    config: LabConfig, artifact: str, exchange: str, market: str, symbol: str, timeframe: str
 ) -> pd.DataFrame | None:
-    if artifact == "indicators":
-        path = processed_indicators_path(config, symbol, timeframe)
-    elif artifact == "regimes":
-        path = processed_regimes_path(config, symbol, timeframe)
-    else:
+    if artifact not in ("indicators", "regimes"):
         raise StorageError(f"unknown artifact {artifact!r}")
+    path = processed_path(config, artifact, exchange, market, symbol, timeframe)
     if not path.exists():
         return None
     df = pd.read_parquet(path)
@@ -250,11 +261,21 @@ def load_processed(
     return df
 
 
+def processed_metadata_path(
+    config: LabConfig, artifact: str, exchange: str, market: str, symbol: str, timeframe: str
+) -> Path:
+    return (
+        metadata_root(config)
+        / "processed" / exchange / market
+        / f"{symbol.upper()}_{timeframe}_{artifact}.json"
+    )
+
+
 def load_processed_metadata(
-    config: LabConfig, artifact: str, symbol: str, timeframe: str
+    config: LabConfig, artifact: str, exchange: str, market: str, symbol: str, timeframe: str
 ) -> dict[str, Any] | None:
     return read_metadata(
-        metadata_root(config) / "processed" / f"{symbol.upper()}_{timeframe}_{artifact}.json"
+        processed_metadata_path(config, artifact, exchange, market, symbol, timeframe)
     )
 
 
@@ -267,6 +288,25 @@ def load_raw_metadata(
     )
 
 
+def find_legacy_processed_artifacts(
+    config: LabConfig, symbol: str, timeframe: str
+) -> list[Path]:
+    """Locate legacy (pre-market-namespace) processed artifacts.
+
+    The old layout stored processed artifacts under
+    ``data/processed/{SYMBOL}/`` with marketless metadata; those files do
+    not record which market produced them, so they must be regenerated
+    rather than trusted.
+    """
+    symbol = symbol.upper()
+    legacy: list[Path] = []
+    for artifact in ("indicators", "regimes"):
+        parquet = cfg_data_dir(config) / "processed" / symbol / f"{timeframe}_{artifact}.parquet"
+        meta = metadata_root(config) / "processed" / f"{symbol}_{timeframe}_{artifact}.json"
+        legacy.extend(p for p in (parquet, meta) if p.exists())
+    return legacy
+
+
 @dataclass
 class FreshnessStatus:
     """Whether a processed artifact matches the current raw dataset."""
@@ -277,6 +317,7 @@ class FreshnessStatus:
     current_raw_hash: str | None = None
     artifact_config_fingerprint: str | None = None
     current_config_fingerprint: str | None = None
+    legacy: bool = False
 
     def describe(self) -> str:
         if self.fresh:
@@ -287,24 +328,55 @@ class FreshnessStatus:
 def check_freshness(
     config: LabConfig,
     artifact: str,
+    exchange: str,
+    market: str,
     symbol: str,
     timeframe: str,
     raw_df: pd.DataFrame,
     config_fingerprint: str | None = None,
 ) -> FreshnessStatus:
-    """Compare a processed artifact's provenance against the current raw data."""
-    metadata = load_processed_metadata(config, artifact, symbol, timeframe)
+    """Compare a processed artifact's provenance against the requested raw data.
+
+    Rejects artifacts whose stored market differs from the requested one,
+    and marketless legacy artifacts (pre-market-namespace layout) even when
+    hashes happen to match.
+    """
+    metadata = load_processed_metadata(config, artifact, exchange, market, symbol, timeframe)
     if metadata is None:
-        return FreshnessStatus(fresh=False, reasons=[f"no {artifact} metadata found"])
+        legacy = bool(find_legacy_processed_artifacts(config, symbol, timeframe))
+        reasons = [f"no {artifact} artifact for market {market!r}"]
+        if legacy:
+            reasons.append(
+                f"legacy marketless artifact exists (regenerate it with "
+                f"`python -m crypto_strategy_lab pipeline --symbol {symbol.upper()} "
+                f"--timeframe {timeframe} --market {market}`)"
+            )
+        return FreshnessStatus(fresh=False, reasons=reasons, legacy=legacy)
+
+    reasons: list[str] = []
+    artifact_market = metadata.get("market")
+    if artifact_market is None:
+        reasons.append("marketless legacy artifact (regenerate to record provenance)")
+    elif artifact_market != market:
+        reasons.append(
+            f"artifact was generated for market {artifact_market!r}, requested {market!r}"
+        )
     source = metadata.get("source") or {}
+    source_market = source.get("market")
+    if source_market is not None and source_market != market:
+        reasons.append(
+            f"artifact source market {source_market!r} != requested {market!r}"
+        )
+
     artifact_hash = source.get("raw_content_hash")
     current_hash = raw_content_hash(raw_df)
-    reasons: list[str] = []
     if artifact_hash != current_hash:
         reasons.append("raw dataset changed since the artifact was generated")
     artifact_fp = metadata.get("regime_config_fingerprint")
     if config_fingerprint is not None and artifact_fp != config_fingerprint:
         reasons.append("regime configuration changed since the artifact was generated")
+
+    legacy = artifact_market is None
     return FreshnessStatus(
         fresh=not reasons,
         reasons=reasons,
@@ -312,6 +384,7 @@ def check_freshness(
         current_raw_hash=current_hash,
         artifact_config_fingerprint=artifact_fp,
         current_config_fingerprint=config_fingerprint,
+        legacy=legacy,
     )
 
 

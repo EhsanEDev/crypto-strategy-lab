@@ -50,10 +50,18 @@ def _resolve_symbol_timeframe(config: LabConfig, symbol: str, timeframe: str) ->
     return symbol, timeframe
 
 
+def _resolve_market(config: LabConfig, market: str | None) -> str:
+    market = (market or config.default_market).lower()
+    if market not in ("spot", "futures"):
+        raise typer.BadParameter(f"market must be 'spot' or 'futures', got {market!r}")
+    return market
+
+
 def _load_research_input(
     config: LabConfig, symbol: str, tf: str, allow_non_ready: bool, market: str | None = None
 ) -> pd.DataFrame:
     from .data.loader import DataNotReadyError, load_raw_validated
+    from .data.storage import StorageError
 
     try:
         return load_raw_validated(
@@ -61,6 +69,9 @@ def _load_research_input(
             allow_non_ready=allow_non_ready,
         )
     except DataNotReadyError as exc:
+        typer.secho(f"[ERROR] {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    except StorageError as exc:
         typer.secho(f"[ERROR] {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
@@ -167,6 +178,7 @@ def _download_one(
 def indicators(
     symbol: str = typer.Option(..., "--symbol"),
     timeframe: str = typer.Option("4h", "--timeframe"),
+    market: str | None = typer.Option(None, "--market", help="futures (default) | spot"),
     allow_non_ready: bool = typer.Option(
         False, "--allow-non-ready", help="explicit override: proceed on imperfect data"
     ),
@@ -179,33 +191,31 @@ def indicators(
     config = load_config(config_path)
     setup_logging(config.log_level)
     symbol, timeframe = _resolve_symbol_timeframe(config, symbol, timeframe)
+    market = _resolve_market(config, market)
 
-    typer.secho(f"Calculating indicators for {symbol} {timeframe}", fg=typer.colors.CYAN)
-    df = _load_research_input(config, symbol, timeframe, allow_non_ready)
+    typer.secho(f"Calculating indicators for {symbol} {timeframe} ({market})", fg=typer.colors.CYAN)
+    df = _load_research_input(config, symbol, timeframe, allow_non_ready, market)
     result = compute_indicators(df, config.regime)
     fingerprint = config_fingerprint(config.regime.model_dump())
     save_processed(
         config,
         "indicators",
-        symbol,
-        timeframe,
-        result,
+        exchange="bitunix",
+        market=market,
+        symbol=symbol,
+        timeframe=timeframe,
+        df=result,
         raw_df=df,
         extra_metadata={"regime_config_fingerprint": fingerprint},
     )
-    typer.echo(f"[INFO] Saved indicators for {symbol} {timeframe} ({len(result):,} rows)")
-
-
-def _load_regime_inputs(
-    config: LabConfig, symbol: str, tf: str, allow_non_ready: bool
-) -> pd.DataFrame:
-    return _load_research_input(config, symbol, tf, allow_non_ready)
+    typer.echo(f"[INFO] Saved indicators for {symbol} {timeframe} ({market}) ({len(result):,} rows)")
 
 
 @app.command()
 def regime(
     symbol: str = typer.Option(..., "--symbol"),
     timeframe: str | None = typer.Option(None, "--timeframe"),
+    market: str | None = typer.Option(None, "--market", help="futures (default) | spot"),
     allow_non_ready: bool = typer.Option(
         False, "--allow-non-ready", help="explicit override: proceed on imperfect data"
     ),
@@ -219,9 +229,10 @@ def regime(
     setup_logging(config.log_level)
     tf = (timeframe or config.regime_timeframe).lower()
     symbol, tf = _resolve_symbol_timeframe(config, symbol, tf)
+    market = _resolve_market(config, market)
 
-    typer.secho(f"Detecting regimes for {symbol} {tf}", fg=typer.colors.CYAN)
-    df = _load_regime_inputs(config, symbol, tf, allow_non_ready)
+    typer.secho(f"Detecting regimes for {symbol} {tf} ({market})", fg=typer.colors.CYAN)
+    df = _load_research_input(config, symbol, tf, allow_non_ready, market)
     labelled = detect_regime(df, config.regime)
 
     distribution = labelled["regime"].value_counts(normalize=True).mul(100).round(1)
@@ -232,19 +243,22 @@ def regime(
     save_processed(
         config,
         "regimes",
-        symbol,
-        tf,
-        labelled,
+        exchange="bitunix",
+        market=market,
+        symbol=symbol,
+        timeframe=tf,
+        df=labelled,
         raw_df=df,
         extra_metadata={"regime_config_fingerprint": fingerprint},
     )
-    typer.echo(f"[INFO] Saved regimes for {symbol} {tf} ({len(labelled):,} rows)")
+    typer.echo(f"[INFO] Saved regimes for {symbol} {tf} ({market}) ({len(labelled):,} rows)")
 
 
 @app.command()
 def report(
     symbol: str = typer.Option(..., "--symbol"),
     timeframe: str | None = typer.Option(None, "--timeframe"),
+    market: str | None = typer.Option(None, "--market", help="futures (default) | spot"),
     allow_non_ready: bool = typer.Option(
         False, "--allow-non-ready", help="explicit override: proceed on imperfect data"
     ),
@@ -253,8 +267,9 @@ def report(
     """Generate the markdown regime report from stored artifacts.
 
     Refuses stale artifacts: if the stored regimes were generated from a
-    different raw dataset or regime configuration, regenerate them first
-    (``python -m crypto_strategy_lab regime --symbol ...``).
+    different raw dataset, a different market, or a different regime
+    configuration, regenerate them first
+    (``python -m crypto_strategy_lab regime --symbol ... --market ...``).
     """
     from .data.storage import (
         check_freshness,
@@ -267,38 +282,46 @@ def report(
     setup_logging(config.log_level)
     tf = (timeframe or config.regime_timeframe).lower()
     symbol, tf = _resolve_symbol_timeframe(config, symbol, tf)
+    market = _resolve_market(config, market)
 
-    raw = _load_research_input(config, symbol, tf, allow_non_ready)
-    regimes = load_processed(config, "regimes", symbol, tf)
+    raw = _load_research_input(config, symbol, tf, allow_non_ready, market)
+    regimes = load_processed(config, "regimes", "bitunix", market, symbol, tf)
     if regimes is None or regimes.empty:
         typer.secho(
-            f"No regime dataset for {symbol} {tf}. Run: "
-            f"python -m crypto_strategy_lab regime --symbol {symbol} --timeframe {tf}",
+            f"No regime dataset for {symbol} {tf} ({market}). Run: "
+            f"python -m crypto_strategy_lab regime --symbol {symbol} --timeframe {tf} "
+            f"--market {market}",
             fg=typer.colors.RED,
             err=True,
         )
         raise typer.Exit(code=1)
 
     fingerprint = config_fingerprint(config.regime.model_dump())
-    freshness = check_freshness(config, "regimes", symbol, tf, raw, config_fingerprint=fingerprint)
+    freshness = check_freshness(
+        config, "regimes", "bitunix", market, symbol, tf, raw, config_fingerprint=fingerprint
+    )
     if not freshness.fresh:
         typer.secho(
-            f"Regime artifact for {symbol} {tf} is stale: {freshness.describe()}. "
-            f"Regenerate it with: python -m crypto_strategy_lab regime --symbol {symbol} --timeframe {tf}",
+            f"Regime artifact for {symbol} {tf} ({market}) is stale: {freshness.describe()}. "
+            f"Regenerate it with: python -m crypto_strategy_lab regime --symbol {symbol} "
+            f"--timeframe {tf} --market {market}",
             fg=typer.colors.RED,
             err=True,
         )
         raise typer.Exit(code=1)
 
-    regimes_metadata = load_processed_metadata(config, "regimes", symbol, tf)
+    regimes_metadata = load_processed_metadata(
+        config, "regimes", "bitunix", market, symbol, tf
+    )
     path = write_regime_report(
         config,
         symbol,
         tf,
         raw,
         regimes,
-        config.regime,
-        fingerprint,
+        market,
+        regime_config=config.regime,
+        fingerprint=fingerprint,
         regimes_metadata=regimes_metadata,
         freshness=freshness,
     )
@@ -313,6 +336,7 @@ def pipeline(
     end: str | None = typer.Option(None, "--end"),
     all_assets: bool = typer.Option(False, "--all", help="run for every configured asset"),
     skip_download: bool = typer.Option(False, "--skip-download"),
+    market: str | None = typer.Option(None, "--market", help="futures (default) | spot"),
     allow_non_ready: bool = typer.Option(
         False, "--allow-non-ready", help="explicit override: proceed on imperfect data"
     ),
@@ -321,13 +345,15 @@ def pipeline(
     """Run the full milestone-1 pipeline: download → indicators → regime → report.
 
     Persists BOTH artifacts (``{tf}_indicators.parquet`` and
-    ``{tf}_regimes.parquet``) and regenerates them, so they are always
-    fresh. Real Bitunix data usually contains exchange-reported OHLC
-    anomalies; without ``--allow-non-ready`` the quality gate stops the
-    pipeline before indicators/regimes/reports on imperfect data.
+    ``{tf}_regimes.parquet``) under the selected market namespace and
+    regenerates them, so they are always fresh. Spot and Futures artifacts
+    never overwrite one another. Real Bitunix data usually contains
+    exchange-reported OHLC anomalies; without ``--allow-non-ready`` the
+    quality gate stops the pipeline before indicators/regimes/reports.
     """
     config = load_config(config_path)
     setup_logging(config.log_level)
+    market = _resolve_market(config, market)
     if all_assets:
         symbols = list(config.assets)
     else:
@@ -339,7 +365,9 @@ def pipeline(
     exit_code = 0
     for sym in symbols:
         try:
-            _run_pipeline_for_symbol(config, sym, timeframe, start, end, skip_download, allow_non_ready)
+            _run_pipeline_for_symbol(
+                config, sym, timeframe, start, end, skip_download, allow_non_ready, market
+            )
         except Exception as exc:  # keep other assets going, report failure
             typer.secho(f"[ERROR] {sym}: {exc}", fg=typer.colors.RED, err=True)
             exit_code = 1
@@ -354,6 +382,7 @@ def _run_pipeline_for_symbol(
     end: str | None,
     skip_download: bool,
     allow_non_ready: bool,
+    market: str | None = None,
 ) -> None:
     from .data.storage import config_fingerprint, save_processed
     from .regime.detector import detect_regime
@@ -362,16 +391,17 @@ def _run_pipeline_for_symbol(
     tf = (timeframe or config.regime_timeframe).lower()
     if tf not in config.timeframes:
         raise typer.BadParameter(f"timeframe {tf!r} is not configured; allowed: {config.timeframes}")
+    market = _resolve_market(config, market)
 
-    typer.secho(f"=== Pipeline {symbol} {tf} ===", fg=typer.colors.CYAN, bold=True)
+    typer.secho(f"=== Pipeline {symbol} {tf} ({market}) ===", fg=typer.colors.CYAN, bold=True)
 
     if not skip_download:
         for raw_tf in config.timeframes:
-            _download_one(config, symbol, raw_tf, start, end)
+            _download_one(config, symbol, raw_tf, start, end, market=market)
     else:
         typer.echo("[INFO] Skipping download (--skip-download)")
 
-    df = _load_research_input(config, symbol, tf, allow_non_ready)
+    df = _load_research_input(config, symbol, tf, allow_non_ready, market)
     typer.echo(f"[INFO] Dataset: {df.index.min()} → {df.index.max()} ({len(df):,} closed candles)")
 
     typer.echo("[INFO] Calculating indicators")
@@ -380,9 +410,11 @@ def _run_pipeline_for_symbol(
     save_processed(
         config,
         "indicators",
-        symbol,
-        tf,
-        labelled.drop(
+        exchange="bitunix",
+        market=market,
+        symbol=symbol,
+        timeframe=tf,
+        df=labelled.drop(
             columns=["regime", "trend_condition", "volatility_condition", "range_condition",
                      "regime_reason", "regime_flags"],
             errors="ignore",
@@ -393,9 +425,11 @@ def _run_pipeline_for_symbol(
     save_processed(
         config,
         "regimes",
-        symbol,
-        tf,
-        labelled,
+        exchange="bitunix",
+        market=market,
+        symbol=symbol,
+        timeframe=tf,
+        df=labelled,
         raw_df=df,
         extra_metadata={"regime_config_fingerprint": fingerprint},
     )
@@ -411,8 +445,10 @@ def _run_pipeline_for_symbol(
     )
     from .data.storage import check_freshness, load_processed_metadata
 
-    regimes_metadata = load_processed_metadata(config, "regimes", symbol, tf)
-    freshness = check_freshness(config, "regimes", symbol, tf, df, config_fingerprint=fingerprint)
+    regimes_metadata = load_processed_metadata(config, "regimes", "bitunix", market, symbol, tf)
+    freshness = check_freshness(
+        config, "regimes", "bitunix", market, symbol, tf, df, config_fingerprint=fingerprint
+    )
     if not freshness.fresh:  # paranoia: artifacts were just regenerated
         typer.secho(
             f"[ERROR] freshly generated artifact failed freshness: {freshness.describe()}",
@@ -426,12 +462,13 @@ def _run_pipeline_for_symbol(
         tf,
         df,
         labelled,
-        config.regime,
-        fingerprint,
+        market,
+        regime_config=config.regime,
+        fingerprint=fingerprint,
         regimes_metadata=regimes_metadata,
         freshness=freshness,
     )
-    typer.echo(f"[INFO] Done: {symbol} {tf}")
+    typer.echo(f"[INFO] Done: {symbol} {tf} ({market})")
 
 
 @app.command("config")

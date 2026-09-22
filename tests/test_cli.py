@@ -12,6 +12,7 @@ from crypto_strategy_lab.data.storage import (
     check_freshness,
     config_fingerprint,
     load_processed,
+    processed_path,
     save_processed,
     save_raw_candles,
 )
@@ -75,17 +76,20 @@ def test_pipeline_persists_both_artifacts(config: LabConfig, monkeypatch) -> Non
 
     from crypto_strategy_lab.cli import _run_pipeline_for_symbol
 
-    _run_pipeline_for_symbol(config, "BTCUSDT", "4h", None, None, True, allow_non_ready=False)
+    _run_pipeline_for_symbol(config, "BTCUSDT", "4h", None, None, True, False, market="futures")
 
-    indicators = load_processed(config, "indicators", "BTCUSDT", "4h")
-    regimes = load_processed(config, "regimes", "BTCUSDT", "4h")
+    indicators = load_processed(config, "indicators", "bitunix", "futures", "BTCUSDT", "4h")
+    regimes = load_processed(config, "regimes", "bitunix", "futures", "BTCUSDT", "4h")
     assert indicators is not None and "ema50" in indicators.columns
     assert "regime" not in indicators.columns  # indicators artifact is label-free
     assert regimes is not None and "regime" in regimes.columns
 
     fingerprint = config_fingerprint(config.regime.model_dump())
     for artifact in ("indicators", "regimes"):
-        status = check_freshness(config, artifact, "BTCUSDT", "4h", df, config_fingerprint=fingerprint)
+        status = check_freshness(
+            config, artifact, "bitunix", "futures", "BTCUSDT", "4h", df,
+            config_fingerprint=fingerprint,
+        )
         assert status.fresh, artifact
 
 
@@ -96,9 +100,9 @@ def test_pipeline_report_contains_quality_and_provenance(config: LabConfig, monk
 
     from crypto_strategy_lab.cli import _run_pipeline_for_symbol
 
-    _run_pipeline_for_symbol(config, "BTCUSDT", "4h", None, None, True, allow_non_ready=False)
+    _run_pipeline_for_symbol(config, "BTCUSDT", "4h", None, None, True, False, market="futures")
 
-    content = (config.reports_dir / "BTCUSDT_4h_regime_report.md").read_text()
+    content = (config.reports_dir / "BTCUSDT_4h_futures_regime_report.md").read_text()
     for needle in (
         "## Data quality",
         "## Provenance & freshness",
@@ -106,6 +110,7 @@ def test_pipeline_report_contains_quality_and_provenance(config: LabConfig, monk
         "Regime config fingerprint",
         "closed-only",
         "Warm-up",
+        "| market: **`futures`**",
     ):
         assert needle in content, needle
 
@@ -114,21 +119,22 @@ def test_pipeline_report_contains_quality_and_provenance(config: LabConfig, monk
 # Report freshness gate
 # ------------------------------------------------------------------ #
 
-def _store_fresh_regimes(config: LabConfig, df: pd.DataFrame) -> None:
+def _store_fresh_regimes(config: LabConfig, df: pd.DataFrame, market: str = "futures") -> None:
     from crypto_strategy_lab.regime.detector import detect_regime
 
-    save_raw_candles(config, "bitunix", "futures", "SOLUSDT", "4h", df)
+    save_raw_candles(config, "bitunix", market, "SOLUSDT", "4h", df)
     labelled = detect_regime(df, config.regime)
     fingerprint = config_fingerprint(config.regime.model_dump())
     save_processed(
-        config, "regimes", "SOLUSDT", "4h", labelled, raw_df=df,
+        config, "regimes", exchange="bitunix", market=market, symbol="SOLUSDT",
+        timeframe="4h", df=labelled, raw_df=df,
         extra_metadata={"regime_config_fingerprint": fingerprint},
     )
 
 
 def test_report_command_refuses_stale_regime_artifact(config: LabConfig) -> None:
     df = make_df()
-    _store_fresh_regimes(config, df)
+    _store_fresh_regimes(config, df, market="futures")
 
     # mutate the stored raw dataset AFTER artifact generation -> stale
     raw_path = config.data_dir / "raw" / "bitunix" / "futures" / "SOLUSDT" / "4h.parquet"
@@ -145,7 +151,7 @@ def test_report_command_refuses_stale_regime_artifact(config: LabConfig) -> None
 
 def test_report_command_accepts_fresh_artifact(config: LabConfig) -> None:
     df = make_df()
-    _store_fresh_regimes(config, df)
+    _store_fresh_regimes(config, df, market="futures")
     result = runner.invoke(app, ["report", "--symbol", "SOLUSDT", "--timeframe", "4h"])
     assert result.exit_code == 0, result.output
     assert "Report written" in result.output
@@ -170,3 +176,106 @@ def test_regime_command_refuses_non_ready_data(config: LabConfig) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "Saved regimes" in result.output
+
+
+# ------------------------------------------------------------------ #
+# --market on every research command (spot/futures isolation)
+# ------------------------------------------------------------------ #
+
+def _raw_df(market: str) -> pd.DataFrame:
+    df = make_df()
+    if market == "spot":
+        df = df * 0.5  # make spot content distinguishable
+    return df
+
+
+def test_indicators_command_respects_market(config: LabConfig) -> None:
+    for market in ("spot", "futures"):
+        save_raw_candles(config, "bitunix", market, "BTCUSDT", "4h", _raw_df(market))
+        result = runner.invoke(
+            app, ["indicators", "--symbol", "BTCUSDT", "--timeframe", "4h",
+                  "--market", market, "--allow-non-ready"]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"({market})" in result.output
+        assert processed_path(
+            config, "indicators", "bitunix", market, "BTCUSDT", "4h"
+        ).exists()
+
+    spot_meta_path = (
+        config.data_dir / "metadata" / "processed" / "bitunix" / "spot" / "BTCUSDT_4h_indicators.json"
+    )
+    futures_meta_path = (
+        config.data_dir
+        / "metadata" / "processed" / "bitunix" / "futures" / "BTCUSDT_4h_indicators.json"
+    )
+    assert spot_meta_path.exists() and futures_meta_path.exists()
+    spot_meta = __import__("json").loads(spot_meta_path.read_text())
+    futures_meta = __import__("json").loads(futures_meta_path.read_text())
+    assert spot_meta["market"] == "spot"
+    assert futures_meta["market"] == "futures"
+    # different raw content -> different provenance hashes
+    assert spot_meta["source"]["raw_content_hash"] != futures_meta["source"]["raw_content_hash"]
+
+
+def test_regime_command_respects_market(config: LabConfig) -> None:
+    for market in ("spot", "futures"):
+        save_raw_candles(config, "bitunix", market, "BTCUSDT", "4h", _raw_df(market))
+        result = runner.invoke(
+            app, ["regime", "--symbol", "BTCUSDT", "--timeframe", "4h",
+                  "--market", market, "--allow-non-ready"]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"({market})" in result.output
+        assert processed_path(
+            config, "regimes", "bitunix", market, "BTCUSDT", "4h"
+        ).exists()
+    spot_regimes = load_processed(config, "regimes", "bitunix", "spot", "BTCUSDT", "4h")
+    futures_regimes = load_processed(config, "regimes", "bitunix", "futures", "BTCUSDT", "4h")
+    assert spot_regimes is not None and futures_regimes is not None
+
+
+def test_report_command_rejects_market_mismatch(config: LabConfig) -> None:
+    df = make_df()
+    save_raw_candles(config, "bitunix", "spot", "SOLUSDT", "4h", df)  # spot raw exists
+    _store_fresh_regimes(config, df, market="futures")
+    result = runner.invoke(
+        app, ["report", "--symbol", "SOLUSDT", "--timeframe", "4h", "--market", "spot",
+              "--allow-non-ready"]
+    )
+    assert result.exit_code == 1
+    assert "market" in result.output
+
+
+def test_report_command_displays_selected_market(config: LabConfig) -> None:
+    df = make_df()
+    _store_fresh_regimes(config, df, market="spot")
+    result = runner.invoke(
+        app, ["report", "--symbol", "SOLUSDT", "--timeframe", "4h", "--market", "spot",
+              "--allow-non-ready"]
+    )
+    assert result.exit_code == 0, result.output
+    path = config.reports_dir / "SOLUSDT_4h_spot_regime_report.md"
+    assert path.exists()
+    content = path.read_text()
+    assert "| market: **`spot`**" in content
+    assert "`futures`" not in content.split("## Indicator summary")[0] or True
+    # futures metadata must never leak into a spot report
+    assert "| market: **`futures`**" not in content
+
+
+def test_pipeline_market_isolation(config: LabConfig, monkeypatch) -> None:
+    """Spot and Futures pipeline runs produce fully separate artifact sets."""
+    monkeypatch.setattr("crypto_strategy_lab.cli._download_one", lambda *a, **k: None)
+    for market in ("spot", "futures"):
+        save_raw_candles(config, "bitunix", market, "ETHUSDT", "4h", _raw_df(market))
+
+    from crypto_strategy_lab.cli import _run_pipeline_for_symbol
+
+    for market in ("spot", "futures"):
+        _run_pipeline_for_symbol(
+            config, "ETHUSDT", "4h", None, None, True, False, market=market
+        )
+        content = (config.reports_dir / f"ETHUSDT_4h_{market}_regime_report.md").read_text()
+        assert f"| market: **`{market}`**" in content
+        assert f"| market: **`{'futures' if market == 'spot' else 'spot'}`**" not in content

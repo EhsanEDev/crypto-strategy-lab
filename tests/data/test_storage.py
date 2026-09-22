@@ -11,9 +11,11 @@ import pytest
 from crypto_strategy_lab.config import LabConfig
 from crypto_strategy_lab.data.storage import (
     StorageError,
+    config_fingerprint,
     load_processed,
     load_raw_candles,
     merge_raw_candles,
+    raw_candles_path,
     read_metadata,
     save_processed,
     save_raw_candles,
@@ -130,22 +132,28 @@ def test_save_and_load_processed(config: LabConfig) -> None:
     df = make_df()
     df["regime"] = "RANGE"
     path = save_processed(
-        config, "regimes", "SOLUSDT", "4h", df,
-        raw_df=df, extra_metadata={"regime_config_fingerprint": "abc"},
+        config, "regimes", exchange="bitunix", market="futures", symbol="SOLUSDT",
+        timeframe="4h", df=df, raw_df=df, extra_metadata={"regime_config_fingerprint": "abc"},
     )
     assert path.name == "4h_regimes.parquet"
-    loaded = load_processed(config, "regimes", "SOLUSDT", "4h")
+    assert path == config.data_dir / "processed" / "bitunix" / "futures" / "SOLUSDT" / "4h_regimes.parquet"
+    loaded = load_processed(config, "regimes", "bitunix", "futures", "SOLUSDT", "4h")
     assert loaded is not None and len(loaded) == len(df)
     assert loaded["regime"].eq("RANGE").all()
 
     metadata = read_metadata(
-        config.data_dir / "metadata" / "processed" / "SOLUSDT_4h_regimes.json"
+        config.data_dir / "metadata" / "processed" / "bitunix" / "futures" / "SOLUSDT_4h_regimes.json"
     )
     assert metadata["artifact"] == "regimes"
     assert metadata["regime_config_fingerprint"] == "abc"
+    assert metadata["exchange"] == "bitunix"
+    assert metadata["market"] == "futures"
+    assert metadata["symbol"] == "SOLUSDT"
+    assert metadata["timeframe"] == "4h"
     # provenance / freshness fields
     source = metadata["source"]
     assert source["exchange"] == "bitunix"
+    assert source["market"] == "futures"
     assert source["raw_rows"] == len(df)
     assert len(source["raw_content_hash"]) == 64
     assert metadata["code_version"]
@@ -174,25 +182,139 @@ def test_check_freshness_detects_raw_and_config_changes(config: LabConfig) -> No
     labelled = df.copy()
     labelled["regime"] = "RANGE"
     fingerprint = config_fingerprint({"a": 1})
-    save_processed(config, "regimes", "BTCUSDT", "4h", labelled, raw_df=df,
+    save_processed(config, "regimes", exchange="bitunix", market="futures", symbol="BTCUSDT",
+                   timeframe="4h", df=labelled, raw_df=df,
                    extra_metadata={"regime_config_fingerprint": fingerprint})
 
-    fresh = check_freshness(config, "regimes", "BTCUSDT", "4h", df, config_fingerprint=fingerprint)
+    fresh = check_freshness(config, "regimes", "bitunix", "futures", "BTCUSDT", "4h", df,
+                            config_fingerprint=fingerprint)
     assert fresh.fresh
 
     # raw dataset changed -> stale
     modified = df.copy()
     modified.iloc[0, modified.columns.get_loc("close")] *= 2
-    stale = check_freshness(config, "regimes", "BTCUSDT", "4h", modified, config_fingerprint=fingerprint)
+    stale = check_freshness(config, "regimes", "bitunix", "futures", "BTCUSDT", "4h", modified,
+                            config_fingerprint=fingerprint)
     assert not stale.fresh
     assert any("raw dataset changed" in r for r in stale.reasons)
 
     # regime config changed -> stale
-    other_fp = check_freshness(config, "regimes", "BTCUSDT", "4h", df, config_fingerprint="other")
+    other_fp = check_freshness(config, "regimes", "bitunix", "futures", "BTCUSDT", "4h", df,
+                               config_fingerprint="other")
     assert not other_fp.fresh
     assert any("configuration changed" in r for r in other_fp.reasons)
 
 
+def test_spot_and_futures_raw_coexist(config: LabConfig) -> None:
+
+    df = make_df()
+    spot_df, _ = save_raw_candles(config, "bitunix", "spot", "BTCUSDT", "4h", df)
+    futures_df, _ = save_raw_candles(config, "bitunix", "futures", "BTCUSDT", "4h", df * 2)
+    # separate files, no cross-contamination
+    assert spot_df.equals(df)
+    assert futures_df.index.equals(df.index) and not futures_df["close"].equals(df["close"])
+    assert raw_candles_path(config, "bitunix", "spot", "BTCUSDT", "4h").exists()
+    assert raw_candles_path(config, "bitunix", "futures", "BTCUSDT", "4h").exists()
+    spot_meta = read_metadata(
+        config.data_dir / "metadata" / "raw" / "bitunix" / "spot" / "BTCUSDT_4h.json"
+    )
+    futures_meta = read_metadata(
+        config.data_dir / "metadata" / "raw" / "bitunix" / "futures" / "BTCUSDT_4h.json"
+    )
+    assert spot_meta["market"] == "spot"
+    assert futures_meta["market"] == "futures"
+    assert spot_meta["raw_content_hash"] != futures_meta["raw_content_hash"]
+
+
+def test_spot_and_futures_processed_coexist(config: LabConfig) -> None:
+    df = make_df()
+    for market, factor in (("spot", 1.0), ("futures", 2.0)):
+        for artifact in ("indicators", "regimes"):
+            frame = df.copy()
+            frame["marker"] = market
+            if artifact == "regimes":
+                frame["regime"] = market.upper()
+            save_processed(
+                config, artifact, exchange="bitunix", market=market, symbol="BTCUSDT",
+                timeframe="4h", df=frame, raw_df=df,
+                extra_metadata={"regime_config_fingerprint": "fp"},
+            )
+    base = config.data_dir / "processed" / "bitunix"
+    assert (base / "spot" / "BTCUSDT" / "4h_regimes.parquet").exists()
+    assert (base / "futures" / "BTCUSDT" / "4h_regimes.parquet").exists()
+    spot_regimes = load_processed(config, "regimes", "bitunix", "spot", "BTCUSDT", "4h")
+    futures_regimes = load_processed(config, "regimes", "bitunix", "futures", "BTCUSDT", "4h")
+    assert spot_regimes["regime"].eq("SPOT").all()
+    assert futures_regimes["regime"].eq("FUTURES").all()
+    spot_meta = read_metadata(
+        config.data_dir / "metadata" / "processed" / "bitunix" / "spot" / "BTCUSDT_4h_regimes.json"
+    )
+    assert spot_meta["market"] == "spot"
+
+
+def test_freshness_rejects_market_mismatch(config: LabConfig) -> None:
+    from crypto_strategy_lab.data.storage import check_freshness, config_fingerprint
+
+    df = make_df()
+    fingerprint = config_fingerprint({"a": 1})
+    save_processed(config, "regimes", exchange="bitunix", market="futures", symbol="BTCUSDT",
+                   timeframe="4h", df=df, raw_df=df,
+                   extra_metadata={"regime_config_fingerprint": fingerprint})
+    # raw data exists for both markets (same content), but the artifact was
+    # generated from futures and is requested for spot -> rejected
+    for market in ("spot",):
+        status = check_freshness(config, "regimes", "bitunix", market, "BTCUSDT", "4h", df,
+                                 config_fingerprint=fingerprint)
+        assert not status.fresh
+        assert any("market" in r for r in status.reasons)
+
+
+def test_freshness_rejects_legacy_marketless_metadata(config: LabConfig) -> None:
+    import json
+
+    from crypto_strategy_lab.data.storage import check_freshness, find_legacy_processed_artifacts
+
+    df = make_df()
+    fingerprint = config_fingerprint({"a": 1})
+
+    # scenario 1: only legacy (pre-market-namespace) files exist
+    legacy_meta_dir = config.data_dir / "metadata" / "processed"
+    legacy_meta_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_meta_dir / "BTCUSDT_4h_regimes.json").write_text(json.dumps({
+        "artifact": "regimes", "symbol": "BTCUSDT", "timeframe": "4h",
+        "regime_config_fingerprint": fingerprint,
+        "source": {"exchange": "bitunix", "raw_content_hash": "whatever"},
+    }))
+    (config.data_dir / "processed" / "BTCUSDT").mkdir(parents=True, exist_ok=True)
+    df.to_parquet(config.data_dir / "processed" / "BTCUSDT" / "4h_regimes.parquet")
+
+    status = check_freshness(config, "regimes", "bitunix", "spot", "BTCUSDT", "4h", df,
+                             config_fingerprint=fingerprint)
+    assert not status.fresh
+    assert status.legacy
+    assert any("legacy marketless artifact exists" in r for r in status.reasons)
+    assert any("regenerate" in r for r in status.reasons)
+    legacy_files = find_legacy_processed_artifacts(config, "BTCUSDT", "4h")
+    assert legacy_files  # both parquet and json detected
+
+    # scenario 2: namespaced metadata exists but lacks the market field
+    save_processed(config, "regimes", exchange="bitunix", market="spot", symbol="BTCUSDT",
+                   timeframe="4h", df=df, raw_df=df,
+                   extra_metadata={"regime_config_fingerprint": fingerprint})
+    meta_path = (
+        config.data_dir / "metadata" / "processed" / "bitunix" / "spot" / "BTCUSDT_4h_regimes.json"
+    )
+    metadata = json.loads(meta_path.read_text())
+    metadata.pop("market")
+    (metadata.get("source") or {}).pop("market", None)
+    meta_path.write_text(json.dumps(metadata))
+    status = check_freshness(config, "regimes", "bitunix", "spot", "BTCUSDT", "4h", df,
+                             config_fingerprint=fingerprint)
+    assert not status.fresh
+    assert status.legacy
+    assert any("marketless legacy artifact" in r for r in status.reasons)
+
+
 def test_load_missing_returns_none(config: LabConfig) -> None:
     assert load_raw_candles(config, "bitunix", "futures", "BTCUSDT", "4h") is None
-    assert load_processed(config, "regimes", "BTCUSDT", "4h") is None
+    assert load_processed(config, "regimes", "bitunix", "futures", "BTCUSDT", "4h") is None

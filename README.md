@@ -148,9 +148,11 @@ python -m crypto_strategy_lab download --symbol BTCUSDT --timeframe 4h --end 202
 Data layout and idempotency:
 
 - Raw candles: `data/raw/bitunix/{market}/{SYMBOL}/{timeframe}.parquet`
-(migration note: the market segment was added in Milestone 1 so spot and
-futures candles — different instruments — can never be merged into one
-dataset; older single-file layouts must be re-downloaded).
+Processed artifacts: `data/processed/bitunix/{market}/{SYMBOL}/{timeframe}_{indicators|regimes}.parquet`
+(migration note: market namespaces were added in Milestone 1 because spot
+and futures are different instruments that can never share or overwrite
+each other's datasets; legacy marketless processed files are detected and
+refused — regenerate them with `pipeline --market ...`).
 - Raw data is **never overwritten destructively**: a download is merged
   into the existing dataset per timestamp. The single exception is a
   bounded trailing overlap (`exchange.refresh_tail_candles`, default 1):
@@ -294,11 +296,17 @@ Or step by step:
 
 ```bash
 python -m crypto_strategy_lab download   --symbol BTCUSDT --timeframe 4h --start 2022-04-17
-python -m crypto_strategy_lab indicators --symbol BTCUSDT --timeframe 4h [--allow-non-ready]
-python -m crypto_strategy_lab regime     --symbol BTCUSDT --timeframe 4h [--allow-non-ready]
-python -m crypto_strategy_lab report     --symbol BTCUSDT --timeframe 4h [--allow-non-ready]
+python -m crypto_strategy_lab indicators --symbol BTCUSDT --timeframe 4h [--market futures] [--allow-non-ready]
+python -m crypto_strategy_lab regime     --symbol BTCUSDT --timeframe 4h [--market futures] [--allow-non-ready]
+python -m crypto_strategy_lab report     --symbol BTCUSDT --timeframe 4h [--market futures] [--allow-non-ready]
 python -m crypto_strategy_lab config     # print resolved configuration
 ```
+
+`--market` (defaulting to `config.default_market`) is available on
+`download`, `indicators`, `regime`, `report` and `pipeline`; spot and
+futures raw data, processed artifacts, metadata and reports are always
+separate namespaces and never overwrite one another. Report filenames
+include the market: `reports/{SYMBOL}_{timeframe}_{market}_regime_report.md`.
 
 `pipeline` regenerates BOTH processed artifacts (`{tf}_indicators.parquet`
 and `{tf}_regimes.parquet`), so they are always fresh, and re-attests
@@ -352,21 +360,20 @@ freshness and quality-gate behaviour.
 data/
 ├── raw/
 │   └── bitunix/
-│       ├── BTCUSDT/{1h,4h,1d}.parquet
-│       ├── ETHUSDT/{1h,4h,1d}.parquet
-│       └── SOLUSDT/{1h,4h,1d}.parquet
+│       ├── futures/{SYMBOL}/{1h,4h,1d}.parquet
+│       └── spot/{SYMBOL}/{1h,4h,1d}.parquet
 ├── processed/
-│   ├── BTCUSDT/{4h_indicators,4h_regimes}.parquet
-│   ├── ETHUSDT/{4h_indicators,4h_regimes}.parquet
-│   └── SOLUSDT/{4h_indicators,4h_regimes}.parquet
+│   └── bitunix/
+│       ├── futures/{SYMBOL}/{4h_indicators,4h_regimes}.parquet
+│       └── spot/{SYMBOL}/{4h_indicators,4h_regimes}.parquet
 └── metadata/
-    ├── raw/bitunix/{SYMBOL}_{timeframe}.json
-    └── processed/{SYMBOL}_{timeframe}_{indicators|regimes}.json
+    ├── raw/bitunix/{market}/{SYMBOL}_{timeframe}.json
+    └── processed/bitunix/{market}/{SYMBOL}_{timeframe}_{indicators|regimes}.json
 
 reports/
-├── BTCUSDT_4h_regime_report.md
-├── ETHUSDT_4h_regime_report.md
-└── SOLUSDT_4h_regime_report.md
+├── BTCUSDT_4h_futures_regime_report.md
+├── ETHUSDT_4h_futures_regime_report.md
+└── SOLUSDT_4h_futures_regime_report.md
 ```
 
 The regimes parquet contains, per candle: `open..volume, quote_volume,
