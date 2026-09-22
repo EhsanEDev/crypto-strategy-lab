@@ -33,18 +33,16 @@ def make_df(n: int = 300, seed: int = 5) -> pd.DataFrame:
 
 def test_save_and_load_raw_roundtrip(config: LabConfig) -> None:
     df = make_df()
-    _, path = save_raw_candles(config, "bitunix", "BTCUSDT", "4h", df)
+    _, path = save_raw_candles(config, "bitunix", "futures", "BTCUSDT", "4h", df)
     assert path.name == "4h.parquet"
-    loaded = load_raw_candles(config, "bitunix", "BTCUSDT", "4h")
+    loaded = load_raw_candles(config, "bitunix", "futures", "BTCUSDT", "4h")
     assert loaded is not None and loaded.equals(df)
 
 
 def test_save_raw_writes_metadata(config: LabConfig) -> None:
     df = make_df()
-    _, path = save_raw_candles(
-        config, "bitunix", "BTCUSDT", "4h", df, extra_metadata={"market": "futures"}
-    )
-    meta_path = config.data_dir / "metadata" / "raw" / "bitunix" / "BTCUSDT_4h.json"
+    _, path = save_raw_candles(config, "bitunix", "futures", "BTCUSDT", "4h", df)
+    meta_path = config.data_dir / "metadata" / "raw" / "bitunix" / "futures" / "BTCUSDT_4h.json"
     metadata = read_metadata(meta_path)
     assert metadata is not None
     assert metadata["exchange"] == "bitunix"
@@ -55,32 +53,50 @@ def test_save_raw_writes_metadata(config: LabConfig) -> None:
     assert metadata["schema_version"] == "1.0"
     assert metadata["start"] == str(df.index.min())
     assert metadata["end"] == str(df.index.max())
+    assert metadata["candles_policy"] == "closed-only"
+    assert metadata["research_ready"] is True
+    assert len(metadata["raw_content_hash"]) == 64
     json.loads(meta_path.read_text())  # valid JSON
 
 
-def test_incremental_save_merges_and_deduplicates(config: LabConfig) -> None:
+def test_incremental_save_merges_deduplicates_and_refreshes_tail(config: LabConfig) -> None:
     df = make_df()
-    save_raw_candles(config, "bitunix", "ETHUSDT", "4h", df)
+    save_raw_candles(config, "bitunix", "futures", "ETHUSDT", "4h", df)
 
-    # "new" download overlaps existing rows and extends by 10 newer candles
-    newer = df.tail(10).copy()
+    # "new" download overlaps the last stored candle (refreshed) and extends
+    # by 10 newer candles
+    newer = df.tail(11).copy()
     newer.index = newer.index + pd.Timedelta(days=100)
     newer = newer * 0.5  # different values; OHLC relations stay valid
 
-    merged, _ = save_raw_candles(config, "bitunix", "ETHUSDT", "4h", newer)
+    merged, _ = save_raw_candles(config, "bitunix", "futures", "ETHUSDT", "4h", newer)
     assert len(merged) == len(df) + 10
-    # existing rows were kept (raw data never overwritten destructively)
-    assert merged["close"].iloc[-11] == df["close"].iloc[-1]
+    # the refreshed tail carries the new values, not the stale stored ones
+    assert merged["close"].iloc[-11] == newer["close"].iloc[0]
     assert merged.index.is_unique and merged.index.is_monotonic_increasing
     assert not np.allclose(merged["close"].iloc[-1], df["close"].iloc[-1])
+
+
+def test_refresh_tail_only_when_new_data_reaches_tail(config: LabConfig) -> None:
+    # backward extension: new data is strictly older - the current tail must
+    # stay untouched even with refresh_tail > 0
+    df = make_df()
+    save_raw_candles(config, "bitunix", "futures", "ETHUSDT", "4h", df)
+    older = df.head(5).copy()
+    older.index = older.index - pd.Timedelta(days=100)
+    older = older * 2.0
+
+    merged, _ = save_raw_candles(config, "bitunix", "futures", "ETHUSDT", "4h", older)
+    assert len(merged) == len(df) + 5
+    assert merged["close"].iloc[-1] == df["close"].iloc[-1]  # tail untouched
 
 
 def test_save_raw_tolerates_ohlc_anomalies_but_records_them(config: LabConfig) -> None:
     df = make_df()
     df.loc[df.index[10], "high"] = df.loc[df.index[10], "low"] - 1  # high < low
-    merged, _ = save_raw_candles(config, "bitunix", "BTCUSDT", "4h", df)
+    merged, _ = save_raw_candles(config, "bitunix", "futures", "BTCUSDT", "4h", df)
     assert len(merged) == len(df)
-    metadata = read_metadata(config.data_dir / "metadata" / "raw" / "bitunix" / "BTCUSDT_4h.json")
+    metadata = read_metadata(config.data_dir / "metadata" / "raw" / "bitunix" / "futures" / "BTCUSDT_4h.json")
     assert metadata["ohlc_anomalies"] >= 1
 
 
@@ -89,7 +105,7 @@ def test_save_raw_deduplicates_download_payload_idempotently(config: LabConfig) 
     # collapse onto the existing dataset (first wins) instead of corrupting it.
     df = make_df()
     duplicated = pd.concat([df, df.iloc[[5]]]).sort_index()
-    merged, _ = save_raw_candles(config, "bitunix", "BTCUSDT", "4h", duplicated)
+    merged, _ = save_raw_candles(config, "bitunix", "futures", "BTCUSDT", "4h", duplicated)
     assert len(merged) == len(df)
     assert merged.index.is_unique
 
@@ -97,7 +113,7 @@ def test_save_raw_deduplicates_download_payload_idempotently(config: LabConfig) 
 def test_save_raw_rejects_empty(config: LabConfig) -> None:
     empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     with pytest.raises(StorageError, match="empty"):
-        save_raw_candles(config, "bitunix", "BTCUSDT", "4h", empty)
+        save_raw_candles(config, "bitunix", "futures", "BTCUSDT", "4h", empty)
 
 
 def test_merge_raw_candles_handles_none_and_gaps() -> None:
@@ -113,7 +129,10 @@ def test_merge_raw_candles_handles_none_and_gaps() -> None:
 def test_save_and_load_processed(config: LabConfig) -> None:
     df = make_df()
     df["regime"] = "RANGE"
-    path = save_processed(config, "regimes", "SOLUSDT", "4h", df, extra_metadata={"regime_config_fingerprint": "abc"})
+    path = save_processed(
+        config, "regimes", "SOLUSDT", "4h", df,
+        raw_df=df, extra_metadata={"regime_config_fingerprint": "abc"},
+    )
     assert path.name == "4h_regimes.parquet"
     loaded = load_processed(config, "regimes", "SOLUSDT", "4h")
     assert loaded is not None and len(loaded) == len(df)
@@ -124,8 +143,56 @@ def test_save_and_load_processed(config: LabConfig) -> None:
     )
     assert metadata["artifact"] == "regimes"
     assert metadata["regime_config_fingerprint"] == "abc"
+    # provenance / freshness fields
+    source = metadata["source"]
+    assert source["exchange"] == "bitunix"
+    assert source["raw_rows"] == len(df)
+    assert len(source["raw_content_hash"]) == 64
+    assert metadata["code_version"]
+    assert metadata["schema_version"] == "1.0"
+    assert "source_rows_sha256" not in metadata  # placeholder removed
+
+
+def test_raw_content_hash_is_deterministic_and_content_sensitive() -> None:
+    from crypto_strategy_lab.data.models import raw_content_hash
+
+    df = make_df()
+    h1 = raw_content_hash(df)
+    h2 = raw_content_hash(df.copy())
+    assert h1 == h2
+    changed = df.copy()
+    changed.iloc[0, changed.columns.get_loc("close")] += 1e-9
+    assert raw_content_hash(changed) != h1
+    reordered = df.iloc[::-1]
+    assert raw_content_hash(reordered) != h1  # shape/order changes flip the hash
+
+
+def test_check_freshness_detects_raw_and_config_changes(config: LabConfig) -> None:
+    from crypto_strategy_lab.data.storage import check_freshness, config_fingerprint
+
+    df = make_df()
+    labelled = df.copy()
+    labelled["regime"] = "RANGE"
+    fingerprint = config_fingerprint({"a": 1})
+    save_processed(config, "regimes", "BTCUSDT", "4h", labelled, raw_df=df,
+                   extra_metadata={"regime_config_fingerprint": fingerprint})
+
+    fresh = check_freshness(config, "regimes", "BTCUSDT", "4h", df, config_fingerprint=fingerprint)
+    assert fresh.fresh
+
+    # raw dataset changed -> stale
+    modified = df.copy()
+    modified.iloc[0, modified.columns.get_loc("close")] *= 2
+    stale = check_freshness(config, "regimes", "BTCUSDT", "4h", modified, config_fingerprint=fingerprint)
+    assert not stale.fresh
+    assert any("raw dataset changed" in r for r in stale.reasons)
+
+    # regime config changed -> stale
+    other_fp = check_freshness(config, "regimes", "BTCUSDT", "4h", df, config_fingerprint="other")
+    assert not other_fp.fresh
+    assert any("configuration changed" in r for r in other_fp.reasons)
 
 
 def test_load_missing_returns_none(config: LabConfig) -> None:
-    assert load_raw_candles(config, "bitunix", "BTCUSDT", "4h") is None
+    assert load_raw_candles(config, "bitunix", "futures", "BTCUSDT", "4h") is None
     assert load_processed(config, "regimes", "BTCUSDT", "4h") is None

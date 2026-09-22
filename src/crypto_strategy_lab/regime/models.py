@@ -40,14 +40,18 @@ REGIME_PRIORITY = [
 
 @dataclass
 class RegimeConditions:
-    """Machine-readable per-candle conditions (stored as JSON)."""
+    """Machine-readable per-candle conditions (stored as JSON).
+
+    Field names are configuration-agnostic (no hard-coded "EMA50"/"EMA200"):
+    ``fast``/``slow`` refer to the configured EMA periods.
+    """
 
     warmup_complete: bool = False
     ema_alignment: bool = False
-    price_above_ema200: bool = False
-    price_below_ema200: bool = False
-    ema50_slope_positive: bool = False
-    ema50_slope_negative: bool = False
+    price_above_slow_ema: bool = False
+    price_below_slow_ema: bool = False
+    fast_ema_slope_positive: bool = False
+    fast_ema_slope_negative: bool = False
     adx_trending: bool = False
     high_volatility: bool = False
     vol_normal: bool = False

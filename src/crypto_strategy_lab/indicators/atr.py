@@ -1,4 +1,4 @@
-"""Average True Range (Wilder).
+"""Average True Range (Wilder, TA-Lib-compatible).
 
 True Range uses the standard definition::
 
@@ -7,17 +7,19 @@ True Range uses the standard definition::
 For the very first candle there is no previous close, so
 ``TR_0 = high_0 - low_0`` (the convention used by TA-Lib).
 
-ATR smoothing method: **Wilder's smoothing** (``alpha = 1/period``, SMA
-seed of the first ``period`` TR values, then the recursive
-``(prev * (period-1) + TR) / period`` equivalent). This is documented here
-so results are reproducible; no external indicator library is used.
+ATR smoothing method: **Wilder's smoothing** in the TA-Lib ``ta_ATR.c``
+convention: the first ATR (at bar ``period``) is the simple mean of the
+True Range of bars ``1..period`` (bar 0 is excluded - it has no previous
+close), and later bars use the mean-preserving recursion
+``ATR = (ATR*(period-1) + TR) / period``. The first valid ATR is at bar
+``period`` (TA-Lib lookback), documented here so results are
+reproducible; no external indicator library is used.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
-
-from ._smoothing import wilder_smooth
 
 
 def true_range(df: pd.DataFrame) -> pd.Series:
@@ -38,10 +40,18 @@ def true_range(df: pd.DataFrame) -> pd.Series:
 
 
 def atr(df: pd.DataFrame, period: int = 14, method: str = "wilder") -> pd.Series:
-    """ATR with the original index preserved."""
+    """ATR with the original index preserved (first valid at bar ``period``)."""
     if period <= 0:
         raise ValueError(f"period must be positive, got {period}")
     if method != "wilder":
         raise ValueError(f"unsupported ATR method {method!r}; only 'wilder' is implemented")
     tr = true_range(df)
-    return wilder_smooth(tr, period)
+    arr = tr.to_numpy(dtype=float)
+    n = len(arr)
+    out = np.full(n, np.nan)
+    if n < period + 1:
+        return pd.Series(out, index=tr.index)
+    out[period] = arr[1 : period + 1].mean()
+    for t in range(period + 1, n):
+        out[t] = (out[t - 1] * (period - 1) + arr[t]) / period
+    return pd.Series(out, index=tr.index)

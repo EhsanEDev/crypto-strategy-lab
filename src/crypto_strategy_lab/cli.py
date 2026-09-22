@@ -9,6 +9,15 @@ Commands::
     python -m crypto_strategy_lab pipeline   --symbol BTCUSDT --timeframe 4h
     python -m crypto_strategy_lab pipeline   --all
 
+Date semantics (all UTC): ``--start YYYY-MM-DD`` begins at that day's
+00:00 UTC; ``--end YYYY-MM-DD`` includes the whole UTC calendar day
+(implemented internally as a next-day exclusive boundary). Timestamp
+inputs are supported consistently (start inclusive instant, end inclusive
+instant). In-progress candles are never persisted as history.
+
+Regime timeframe defaults to the configured ``regime_timeframe`` (4h for
+Milestone 1); any configured timeframe can be passed explicitly.
+
 There is deliberately no order/trading command: this milestone is
 research-only (see README Non-Goals).
 """
@@ -29,8 +38,6 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
 )
 
-REGIME_TIMEFRAME_NOTE = "regime detection is defined for the configured regime timeframe"
-
 
 def _resolve_symbol_timeframe(config: LabConfig, symbol: str, timeframe: str) -> tuple[str, str]:
     symbol = symbol.upper()
@@ -43,16 +50,35 @@ def _resolve_symbol_timeframe(config: LabConfig, symbol: str, timeframe: str) ->
     return symbol, timeframe
 
 
+def _load_research_input(
+    config: LabConfig, symbol: str, tf: str, allow_non_ready: bool, market: str | None = None
+) -> pd.DataFrame:
+    from .data.loader import DataNotReadyError, load_raw_validated
+
+    try:
+        return load_raw_validated(
+            config, "bitunix", market or config.default_market, symbol, tf,
+            allow_non_ready=allow_non_ready,
+        )
+    except DataNotReadyError as exc:
+        typer.secho(f"[ERROR] {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @app.command()
 def download(
     symbol: str = typer.Option(..., "--symbol", help="e.g. BTCUSDT"),
     timeframe: str = typer.Option("4h", "--timeframe", help="1h | 4h | 1d"),
-    start: str | None = typer.Option(None, "--start", help="YYYY-MM-DD inclusive"),
-    end: str | None = typer.Option(None, "--end", help="YYYY-MM-DD inclusive"),
-    market: str | None = typer.Option(None, "--market", help="futures (default) | spot"),
+    start: str | None = typer.Option(None, "--start", help="YYYY-MM-DD or UTC timestamp (inclusive)"),
+    end: str | None = typer.Option(None, "--end", help="YYYY-MM-DD or UTC timestamp (whole day included)"),
+    market: str | None = typer.Option(None, "--market", help="futures (default) | spot (kline/history)"),
     config_path: str | None = typer.Option(None, "--config"),
 ) -> None:
-    """Download historical candles from Bitunix and store them as Parquet."""
+    """Download historical CLOSED candles from Bitunix into Parquet.
+
+    Incremental and idempotent: only missing ranges are fetched, the last
+    stored candle is refreshed, and in-progress candles are never stored.
+    """
     config = load_config(config_path)
     setup_logging(config.log_level)
     symbol, timeframe = _resolve_symbol_timeframe(config, symbol, timeframe)
@@ -103,7 +129,7 @@ def _download_one(
     market = (market or config.default_market).lower()
     requested_start = start or config.default_start
 
-    existing = load_raw(config, "bitunix", symbol, timeframe)
+    existing = load_raw(config, "bitunix", market, symbol, timeframe)
     ranges = download_ranges(existing, requested_start, end)
     if not ranges:
         typer.echo(f"[INFO] {symbol} {timeframe}: already up to date (last candle {existing.index.max()})")
@@ -120,18 +146,18 @@ def _download_one(
                 symbol, timeframe, start=range_start, end=range_end, allow_empty=True
             )
         if df.empty:
-            typer.echo(f"[INFO] {symbol} {timeframe}: no new candles; already up to date")
+            typer.echo(f"[INFO] {symbol} {timeframe}: no new closed candles; already up to date")
             continue
         typer.echo(
-            f"[INFO] Received {len(df):,} candles ({df.index.min()} → {df.index.max()})"
+            f"[INFO] Received {len(df):,} closed candles ({df.index.min()} → {df.index.max()})"
         )
         merged, path = save_raw_candles(
             config,
             exchange="bitunix",
+            market=market,
             symbol=symbol,
             timeframe=timeframe,
             new_df=df,
-            extra_metadata={"market": market},
         )
         typer.echo(f"[INFO] Validation passed ({len(merged):,} rows total)")
         typer.echo(f"[INFO] Saved {path}")
@@ -141,10 +167,12 @@ def _download_one(
 def indicators(
     symbol: str = typer.Option(..., "--symbol"),
     timeframe: str = typer.Option("4h", "--timeframe"),
+    allow_non_ready: bool = typer.Option(
+        False, "--allow-non-ready", help="explicit override: proceed on imperfect data"
+    ),
     config_path: str | None = typer.Option(None, "--config"),
 ) -> None:
-    """Compute v001 indicators for a stored dataset."""
-    from .data.loader import load_raw_validated
+    """Compute v001 indicators for a stored dataset (quality gate enforced)."""
     from .data.storage import config_fingerprint, save_processed
     from .indicators.registry import compute_indicators
 
@@ -153,7 +181,7 @@ def indicators(
     symbol, timeframe = _resolve_symbol_timeframe(config, symbol, timeframe)
 
     typer.secho(f"Calculating indicators for {symbol} {timeframe}", fg=typer.colors.CYAN)
-    df = load_raw_validated(config, "bitunix", symbol, timeframe)
+    df = _load_research_input(config, symbol, timeframe, allow_non_ready)
     result = compute_indicators(df, config.regime)
     fingerprint = config_fingerprint(config.regime.model_dump())
     save_processed(
@@ -162,19 +190,28 @@ def indicators(
         symbol,
         timeframe,
         result,
+        raw_df=df,
         extra_metadata={"regime_config_fingerprint": fingerprint},
     )
     typer.echo(f"[INFO] Saved indicators for {symbol} {timeframe} ({len(result):,} rows)")
+
+
+def _load_regime_inputs(
+    config: LabConfig, symbol: str, tf: str, allow_non_ready: bool
+) -> pd.DataFrame:
+    return _load_research_input(config, symbol, tf, allow_non_ready)
 
 
 @app.command()
 def regime(
     symbol: str = typer.Option(..., "--symbol"),
     timeframe: str | None = typer.Option(None, "--timeframe"),
+    allow_non_ready: bool = typer.Option(
+        False, "--allow-non-ready", help="explicit override: proceed on imperfect data"
+    ),
     config_path: str | None = typer.Option(None, "--config"),
 ) -> None:
-    """Detect regimes for a stored dataset (indicators are computed here)."""
-    from .data.loader import load_raw_validated
+    """Detect regimes for a stored dataset (quality gate enforced)."""
     from .data.storage import config_fingerprint, save_processed
     from .regime.detector import detect_regime
 
@@ -184,7 +221,7 @@ def regime(
     symbol, tf = _resolve_symbol_timeframe(config, symbol, tf)
 
     typer.secho(f"Detecting regimes for {symbol} {tf}", fg=typer.colors.CYAN)
-    df = load_raw_validated(config, "bitunix", symbol, tf)
+    df = _load_regime_inputs(config, symbol, tf, allow_non_ready)
     labelled = detect_regime(df, config.regime)
 
     distribution = labelled["regime"].value_counts(normalize=True).mul(100).round(1)
@@ -198,6 +235,7 @@ def regime(
         symbol,
         tf,
         labelled,
+        raw_df=df,
         extra_metadata={"regime_config_fingerprint": fingerprint},
     )
     typer.echo(f"[INFO] Saved regimes for {symbol} {tf} ({len(labelled):,} rows)")
@@ -207,18 +245,30 @@ def regime(
 def report(
     symbol: str = typer.Option(..., "--symbol"),
     timeframe: str | None = typer.Option(None, "--timeframe"),
+    allow_non_ready: bool = typer.Option(
+        False, "--allow-non-ready", help="explicit override: proceed on imperfect data"
+    ),
     config_path: str | None = typer.Option(None, "--config"),
 ) -> None:
-    """Generate the markdown regime report from stored artifacts."""
-    from .data.loader import load_raw_validated
-    from .data.storage import load_processed
+    """Generate the markdown regime report from stored artifacts.
+
+    Refuses stale artifacts: if the stored regimes were generated from a
+    different raw dataset or regime configuration, regenerate them first
+    (``python -m crypto_strategy_lab regime --symbol ...``).
+    """
+    from .data.storage import (
+        check_freshness,
+        config_fingerprint,
+        load_processed,
+        load_processed_metadata,
+    )
 
     config = load_config(config_path)
     setup_logging(config.log_level)
     tf = (timeframe or config.regime_timeframe).lower()
     symbol, tf = _resolve_symbol_timeframe(config, symbol, tf)
 
-    raw = load_raw_validated(config, "bitunix", symbol, tf)
+    raw = _load_research_input(config, symbol, tf, allow_non_ready)
     regimes = load_processed(config, "regimes", symbol, tf)
     if regimes is None or regimes.empty:
         typer.secho(
@@ -229,7 +279,29 @@ def report(
         )
         raise typer.Exit(code=1)
 
-    path = write_regime_report(config, symbol, tf, raw, regimes, config.regime)
+    fingerprint = config_fingerprint(config.regime.model_dump())
+    freshness = check_freshness(config, "regimes", symbol, tf, raw, config_fingerprint=fingerprint)
+    if not freshness.fresh:
+        typer.secho(
+            f"Regime artifact for {symbol} {tf} is stale: {freshness.describe()}. "
+            f"Regenerate it with: python -m crypto_strategy_lab regime --symbol {symbol} --timeframe {tf}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    regimes_metadata = load_processed_metadata(config, "regimes", symbol, tf)
+    path = write_regime_report(
+        config,
+        symbol,
+        tf,
+        raw,
+        regimes,
+        config.regime,
+        fingerprint,
+        regimes_metadata=regimes_metadata,
+        freshness=freshness,
+    )
     typer.echo(f"[INFO] Report written: {path}")
 
 
@@ -241,9 +313,19 @@ def pipeline(
     end: str | None = typer.Option(None, "--end"),
     all_assets: bool = typer.Option(False, "--all", help="run for every configured asset"),
     skip_download: bool = typer.Option(False, "--skip-download"),
+    allow_non_ready: bool = typer.Option(
+        False, "--allow-non-ready", help="explicit override: proceed on imperfect data"
+    ),
     config_path: str | None = typer.Option(None, "--config"),
 ) -> None:
-    """Run the full milestone-1 pipeline: download → indicators → regime → report."""
+    """Run the full milestone-1 pipeline: download → indicators → regime → report.
+
+    Persists BOTH artifacts (``{tf}_indicators.parquet`` and
+    ``{tf}_regimes.parquet``) and regenerates them, so they are always
+    fresh. Real Bitunix data usually contains exchange-reported OHLC
+    anomalies; without ``--allow-non-ready`` the quality gate stops the
+    pipeline before indicators/regimes/reports on imperfect data.
+    """
     config = load_config(config_path)
     setup_logging(config.log_level)
     if all_assets:
@@ -257,7 +339,7 @@ def pipeline(
     exit_code = 0
     for sym in symbols:
         try:
-            _run_pipeline_for_symbol(config, sym, timeframe, start, end, skip_download)
+            _run_pipeline_for_symbol(config, sym, timeframe, start, end, skip_download, allow_non_ready)
         except Exception as exc:  # keep other assets going, report failure
             typer.secho(f"[ERROR] {sym}: {exc}", fg=typer.colors.RED, err=True)
             exit_code = 1
@@ -271,8 +353,8 @@ def _run_pipeline_for_symbol(
     start: str | None,
     end: str | None,
     skip_download: bool,
+    allow_non_ready: bool,
 ) -> None:
-    from .data.loader import load_raw_validated
     from .data.storage import config_fingerprint, save_processed
     from .regime.detector import detect_regime
     from .regime.models import REGIME_PRIORITY
@@ -288,18 +370,33 @@ def _run_pipeline_for_symbol(
             _download_one(config, symbol, raw_tf, start, end)
     else:
         typer.echo("[INFO] Skipping download (--skip-download)")
-    df = load_raw_validated(config, "bitunix", symbol, tf)
-    typer.echo(f"[INFO] Dataset: {df.index.min()} → {df.index.max()} ({len(df):,} candles)")
+
+    df = _load_research_input(config, symbol, tf, allow_non_ready)
+    typer.echo(f"[INFO] Dataset: {df.index.min()} → {df.index.max()} ({len(df):,} closed candles)")
 
     typer.echo("[INFO] Calculating indicators")
     labelled = detect_regime(df, config.regime)
     fingerprint = config_fingerprint(config.regime.model_dump())
     save_processed(
         config,
+        "indicators",
+        symbol,
+        tf,
+        labelled.drop(
+            columns=["regime", "trend_condition", "volatility_condition", "range_condition",
+                     "regime_reason", "regime_flags"],
+            errors="ignore",
+        ),
+        raw_df=df,
+        extra_metadata={"regime_config_fingerprint": fingerprint},
+    )
+    save_processed(
+        config,
         "regimes",
         symbol,
         tf,
         labelled,
+        raw_df=df,
         extra_metadata={"regime_config_fingerprint": fingerprint},
     )
 
@@ -312,7 +409,28 @@ def _run_pipeline_for_symbol(
     typer.echo(
         f"[INFO] Indicator warm-up: first {warmup_bars(config.regime)} bars are UNCERTAIN by design"
     )
-    write_regime_report(config, symbol, tf, df, labelled, config.regime, fingerprint)
+    from .data.storage import check_freshness, load_processed_metadata
+
+    regimes_metadata = load_processed_metadata(config, "regimes", symbol, tf)
+    freshness = check_freshness(config, "regimes", symbol, tf, df, config_fingerprint=fingerprint)
+    if not freshness.fresh:  # paranoia: artifacts were just regenerated
+        typer.secho(
+            f"[ERROR] freshly generated artifact failed freshness: {freshness.describe()}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    write_regime_report(
+        config,
+        symbol,
+        tf,
+        df,
+        labelled,
+        config.regime,
+        fingerprint,
+        regimes_metadata=regimes_metadata,
+        freshness=freshness,
+    )
     typer.echo(f"[INFO] Done: {symbol} {tf}")
 
 

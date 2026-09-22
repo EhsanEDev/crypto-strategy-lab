@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +38,28 @@ class ExchangeSettings(BaseModel):
     max_retries: int = 3
     retry_backoff_seconds: float = 1.5
     page_delay_seconds: float = 0.25
+    # page sizes are capped server-side (verified live): futures 200, spot history 500
+    futures_page_size: int = 200
+    spot_history_page_size: int = 500
+    # how many trailing stored candles a re-download refreshes (guards against
+    # a previously stored not-yet-closed candle sticking around forever)
+    refresh_tail_candles: int = 1
+    # hard loop guard for pagination (pages per single fetch)
+    max_pages: int = 5000
+
+    @field_validator("futures_page_size", "spot_history_page_size", "refresh_tail_candles", "max_pages")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("must be >= 0")
+        return v
+
+    @field_validator("page_delay_seconds", "retry_backoff_seconds", "timeout_seconds")
+    @classmethod
+    def _non_negative_float(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("must be >= 0")
+        return v
 
 
 class RegimeConfig(BaseModel):
@@ -57,7 +79,7 @@ class RegimeConfig(BaseModel):
     volatility_percentile: float = 90.0
     volatility_lookback: int = 200
 
-    # EMA50 slope is measured over this many bars.
+    # fast EMA slope is measured over this many bars.
     slope_lookback: int = 5
 
     # Range requires volatility to be *below* this percentile of trailing
@@ -78,6 +100,28 @@ class RegimeConfig(BaseModel):
         if v <= 0:
             raise ValueError("must be a positive integer")
         return v
+
+    @field_validator("volatility_percentile", "range_volatility_percentile")
+    @classmethod
+    def _percentile(cls, v: float) -> float:
+        if not 0.0 < v <= 100.0:
+            raise ValueError("percentile must be within (0, 100]")
+        return v
+
+    @field_validator("adx_trend_threshold")
+    @classmethod
+    def _adx_threshold(cls, v: float) -> float:
+        if not 0.0 < v < 100.0:
+            raise ValueError("adx_trend_threshold must be within (0, 100)")
+        return v
+
+    @model_validator(mode="after")
+    def _fast_below_slow(self) -> "RegimeConfig":
+        if self.ema_fast >= self.ema_slow:
+            raise ValueError(
+                f"ema_fast ({self.ema_fast}) must be strictly smaller than ema_slow ({self.ema_slow})"
+            )
+        return self
 
 
 class LabConfig(BaseModel):
@@ -115,6 +159,17 @@ class LabConfig(BaseModel):
                 raise ValueError(f"unsupported timeframe {value!r}; allowed: {SUPPORTED_TIMEFRAMES}")
             return tf_norm
         return value
+
+    @model_validator(mode="after")
+    def _regime_timeframe_configured(self) -> "LabConfig":
+        if self.regime_timeframe not in self.timeframes:
+            raise ValueError(
+                f"regime_timeframe {self.regime_timeframe!r} must be one of the configured "
+                f"timeframes {self.timeframes}"
+            )
+        if self.default_market not in ("futures", "spot"):
+            raise ValueError(f"default_market must be 'futures' or 'spot', got {self.default_market!r}")
+        return self
 
     def validate_symbols(self, symbols: list[str]) -> None:
         for symbol in symbols:

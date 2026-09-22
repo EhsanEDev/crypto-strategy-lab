@@ -114,10 +114,10 @@ def detect_regime(df: pd.DataFrame, config: RegimeConfig) -> pd.DataFrame:
         conditions = RegimeConditions(
             warmup_complete=bool(warmup_complete.iloc[i]),
             ema_alignment=bool(ema_aligned_up.iloc[i] or ema_aligned_down.iloc[i]),
-            price_above_ema200=bool(price_above.iloc[i]) if warmup_complete.iloc[i] else False,
-            price_below_ema200=bool(price_below.iloc[i]) if warmup_complete.iloc[i] else False,
-            ema50_slope_positive=bool(slope_up.iloc[i]) if warmup_complete.iloc[i] else False,
-            ema50_slope_negative=bool(slope_down.iloc[i]) if warmup_complete.iloc[i] else False,
+            price_above_slow_ema=bool(price_above.iloc[i]) if warmup_complete.iloc[i] else False,
+            price_below_slow_ema=bool(price_below.iloc[i]) if warmup_complete.iloc[i] else False,
+            fast_ema_slope_positive=bool(slope_up.iloc[i]) if warmup_complete.iloc[i] else False,
+            fast_ema_slope_negative=bool(slope_down.iloc[i]) if warmup_complete.iloc[i] else False,
             adx_trending=bool(adx_trending.iloc[i]) if warmup_complete.iloc[i] else False,
             high_volatility=bool(high_vol.iloc[i]) if warmup_complete.iloc[i] else False,
             vol_normal=bool(vol_normal_mask.iloc[i]) if warmup_complete.iloc[i] else False,
@@ -139,6 +139,7 @@ def detect_regime(df: pd.DataFrame, config: RegimeConfig) -> pd.DataFrame:
 
 
 def _build_reason(label: str, conditions: RegimeConditions, config: RegimeConfig) -> str:
+    fast, slow = f"EMA{config.ema_fast}", f"EMA{config.ema_slow}"
     if not conditions.warmup_complete:
         return "Indicator warm-up incomplete; regime not evaluated"
     if label == Regime.HIGH_VOLATILITY.value:
@@ -147,16 +148,23 @@ def _build_reason(label: str, conditions: RegimeConditions, config: RegimeConfig
             f"(lookback={config.volatility_lookback})"
         )
     if label == Regime.TREND_UP.value:
-        return "EMA50 > EMA200; close > EMA200; EMA50 slope positive; ADX above threshold"
+        return (
+            f"{fast} > {slow}; close > {slow}; {fast} slope positive; ADX above threshold"
+        )
     if label == Regime.TREND_DOWN.value:
-        return "EMA50 < EMA200; close < EMA200; EMA50 slope negative; ADX above threshold"
+        return (
+            f"{fast} < {slow}; close < {slow}; {fast} slope negative; ADX above threshold"
+        )
     if label == Regime.RANGE.value:
         return (
             f"ADX below threshold ({config.adx_trend_threshold:g}); "
             f"ATR% below rolling {config.range_volatility_percentile:g}th percentile"
         )
     if not conditions.ema_alignment:
-        return "No rule matched: EMA50 and EMA200 not aligned for a trend; ADX/range rules unmatched"
+        return (
+            f"No rule matched: {fast} and {slow} not aligned for a trend; "
+            "ADX/range rules unmatched"
+        )
     if conditions.adx_trending:
         return "No rule matched: ADX trending but price/EMA/slope conditions incomplete"
     return "No rule matched: ADX between configurations; conditions ambiguous"

@@ -1,7 +1,10 @@
 """Research report generation (markdown) for regime datasets.
 
 Reports are derived from already-validated artifacts; they never mutate
-datasets and never generate signals.
+datasets and never generate signals. Each report carries full provenance
+(source, raw content hash, config fingerprint), data-quality status and
+the closed-candle policy, so a report can always be audited against the
+exact raw data it was produced from.
 """
 
 from __future__ import annotations
@@ -10,10 +13,12 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
 from ..config import LabConfig, RegimeConfig, reports_dir
+from ..data.storage import FreshnessStatus, load_raw_metadata
 from ..data.validator import validate_ohlcv
 
 logger = logging.getLogger(__name__)
@@ -91,11 +96,15 @@ def build_report(
     regimes: pd.DataFrame,
     config: RegimeConfig,
     stats: RegimeStats,
+    raw_metadata: dict[str, Any] | None = None,
+    regimes_metadata: dict[str, Any] | None = None,
+    freshness: FreshnessStatus | None = None,
     regime_config_fingerprint: str | None = None,
 ) -> str:
     """Render the markdown report for one asset/timeframe."""
     validation = validate_ohlcv(raw, timeframe)
     ind_summary = _indicator_summary(regimes, config)
+    raw_metadata = raw_metadata or {}
     lines: list[str] = []
     lines.append(f"# {symbol} — {timeframe} Regime Report")
     lines.append("")
@@ -114,6 +123,39 @@ def build_report(
     lines.append(
         f"- OHLC anomalies (exchange-reported inconsistencies): **{validation.ohlc_anomalies}**"
     )
+    lines.append(
+        f"- Misaligned timestamps: **{validation.misaligned_timestamps}**"
+        f" | NaN/infinite values: **{validation.non_finite_values}**"
+    )
+    lines.append("")
+
+    lines.append("## Data quality")
+    lines.append(f"- Quality gate: **{_quality_label(raw_metadata, freshness)}**")
+    lines.append("- Candle policy: **closed-only** — in-progress candles are never "
+                 "persisted as history; the last stored candle is refreshed "
+                 "(replaced) on re-download if the exchange revised it.")
+    lines.append(
+        "- OHLC anomalies are kept as received (audit trail), never silently "
+        "repaired; strict validation refuses them for research use."
+    )
+    lines.append("")
+
+    lines.append("## Provenance & freshness")
+    lines.append("")
+    lines.append(f"- Exchange: `{raw_metadata.get('exchange', 'bitunix')}` "
+                 f"| market: `{raw_metadata.get('market', '?')}`")
+    lines.append(f"- Raw range: `{raw_metadata.get('start', '?')}` → `{raw_metadata.get('end', '?')}` "
+                 f"({raw_metadata.get('rows', '?')} candles)")
+    lines.append(f"- Raw content hash: `{raw_metadata.get('raw_content_hash', 'n/a')[:16]}…`")
+    artifact_fp = (regimes_metadata or {}).get("regime_config_fingerprint", regime_config_fingerprint)
+    lines.append(f"- Regime config fingerprint: `{artifact_fp}`")
+    lines.append(f"- Generated at: `{(regimes_metadata or {}).get('generated_at', 'n/a')}` "
+                 f"(code v{(regimes_metadata or {}).get('code_version', '?')}, "
+                 f"schema v{(regimes_metadata or {}).get('schema_version', '?')})")
+    lines.append(
+        f"- Artifact freshness: **{'fresh' if (freshness and freshness.fresh) else 'stale/unverifiable'}**"
+        + (f" ({'; '.join(freshness.reasons)})" if freshness and not freshness.fresh else "")
+    )
     lines.append("")
 
     lines.append("## Indicator summary")
@@ -128,8 +170,9 @@ def build_report(
         )
     lines.append("")
     lines.append(
-        "> Warm-up: EMA/ATR/RSI/ADX need history before their first defined value "
-        "(EMA200 ≈ 199 bars, ADX ≈ 2×period−2 bars). Early NaNs are expected and never filled."
+        "> Warm-up (TA-Lib-compatible conventions): EMA slow needs `ema_slow - 1` bars, "
+        "ADX needs `2*period - 1` bars (first ADX at bar 27 for period 14), RSI/ATR need "
+        "`period` bars. Early NaNs are expected and never filled."
     )
     lines.append("")
 
@@ -163,14 +206,24 @@ def build_report(
         )
     lines.append("")
 
-    if regime_config_fingerprint:
-        lines.append("## Reproducibility")
-        lines.append("")
-        lines.append(f"- regime config fingerprint: `{regime_config_fingerprint}`")
-        lines.append("- thresholds live in `config/default.yaml` (section `regime`)")
-        lines.append("")
+    lines.append("## Reproducibility")
+    lines.append("")
+    lines.append(f"- regime config fingerprint: `{regime_config_fingerprint}`")
+    lines.append("- thresholds live in `config/default.yaml` (section `regime`)")
+    lines.append("- regenerate: `python -m crypto_strategy_lab regime --symbol "
+                 f"{symbol} --timeframe {timeframe}`")
+    lines.append("")
 
     return "\n".join(lines)
+
+
+def _quality_label(raw_metadata: dict[str, Any], freshness: FreshnessStatus | None) -> str:
+    if raw_metadata.get("research_ready") is True:
+        return "READY (strict validation passed)"
+    label = "NOT READY (strict validation failed: gaps/OHLC anomalies/misalignment)"
+    if freshness is not None and not freshness.fresh:
+        label += "; artifact freshness: stale"
+    return label
 
 
 def _indicator_summary(regimes: pd.DataFrame, config: RegimeConfig) -> list[tuple[str, str]]:
@@ -191,10 +244,16 @@ def write_regime_report(
     regimes: pd.DataFrame,
     regime_config: RegimeConfig | None = None,
     fingerprint: str | None = None,
+    raw_metadata: dict[str, Any] | None = None,
+    regimes_metadata: dict[str, Any] | None = None,
+    freshness: FreshnessStatus | None = None,
+    market: str = "futures",
 ) -> Path:
     """Render and write ``reports/{SYMBOL}_{timeframe}_regime_report.md``."""
     regime_config = regime_config or config.regime
     stats = compute_regime_stats(regimes)
+    if raw_metadata is None:
+        raw_metadata = load_raw_metadata(config, "bitunix", market, symbol, timeframe) or {}
     markdown = build_report(
         symbol=symbol.upper(),
         timeframe=timeframe,
@@ -202,6 +261,9 @@ def write_regime_report(
         regimes=regimes,
         config=regime_config,
         stats=stats,
+        raw_metadata=raw_metadata,
+        regimes_metadata=regimes_metadata,
+        freshness=freshness,
         regime_config_fingerprint=fingerprint,
     )
     path = reports_dir(config) / f"{symbol.upper()}_{timeframe}_regime_report.md"

@@ -70,8 +70,8 @@ def test_trend_up_synthetic() -> None:
     assert "ADX above threshold" in reason
     flags = json.loads(result["regime_flags"].iloc[-1])
     assert flags["ema_alignment"] is True
-    assert flags["price_above_ema200"] is True
-    assert flags["ema50_slope_positive"] is True
+    assert flags["price_above_slow_ema"] is True
+    assert flags["fast_ema_slope_positive"] is True
     assert flags["adx_trending"] is True
     assert flags["high_volatility"] is False
 
@@ -131,7 +131,7 @@ def test_priority_order_is_documented() -> None:
     assert isinstance(Regime.TREND_UP.value, str)
 
 
-def test_reasons_are_machine_readable() -> None:
+def test_reasons_are_machine_readable_and_config_agnostic() -> None:
     df = trend_up_fixture()
     result = detect_regime(df, RegimeConfig())
     for flags_json in result["regime_flags"].iloc[-50:]:
@@ -139,16 +139,25 @@ def test_reasons_are_machine_readable() -> None:
         assert set(flags) == {
             "warmup_complete",
             "ema_alignment",
-            "price_above_ema200",
-            "price_below_ema200",
-            "ema50_slope_positive",
-            "ema50_slope_negative",
+            "price_above_slow_ema",
+            "price_below_slow_ema",
+            "fast_ema_slope_positive",
+            "fast_ema_slope_negative",
             "adx_trending",
             "high_volatility",
             "vol_normal",
             "range_candidate",
         }
         assert all(isinstance(v, bool) for v in flags.values())
+
+    # reasons reference the *configured* EMA periods, never hard-coded names
+    custom = RegimeConfig(ema_fast=20, ema_slow=100)
+    labelled = detect_regime(df, custom)
+    trend_rows = labelled[labelled["regime"] == "TREND_UP"]
+    assert not trend_rows.empty
+    reason = trend_rows["regime_reason"].iloc[-1]
+    assert "EMA20" in reason and "EMA100" in reason
+    assert "EMA50" not in reason and "EMA200" not in reason
 
 
 def test_no_lookahead_prefix_invariance() -> None:

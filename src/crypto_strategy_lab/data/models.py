@@ -6,6 +6,7 @@ touch validation, storage or research code.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -110,3 +111,70 @@ def to_utc_timestamp(value: str | pd.Timestamp) -> pd.Timestamp:
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     return ts.tz_convert("UTC")
+
+
+def _is_date_only(value: str) -> bool:
+    """True for ``YYYY-MM-DD`` inputs (no time component)."""
+    return "T" not in value and " " not in value.strip()
+
+
+def parse_start_bound(value: str) -> pd.Timestamp:
+    """Inclusive start bound in UTC.
+
+    ``YYYY-MM-DD`` begins at that day's 00:00 UTC; an input with a time
+    component is used as the exact instant. Candles opening at or after the
+    bound are included.
+    """
+    return to_utc_timestamp(value.strip())
+
+
+def parse_end_bound_exclusive(value: str) -> pd.Timestamp:
+    """Exclusive end bound in UTC.
+
+    ``YYYY-MM-DD`` includes the whole UTC calendar day, implemented as the
+    next day's 00:00 UTC exclusive boundary. An input with a time component
+    is treated as an inclusive instant (candles opening exactly at it are
+    kept), implemented as ``instant + 1ms`` exclusive. Candles opening
+    strictly before the bound are included.
+    """
+    text = value.strip()
+    if _is_date_only(text):
+        return to_utc_timestamp(text) + pd.Timedelta(days=1)
+    return to_utc_timestamp(text) + pd.Timedelta(milliseconds=1)
+
+
+def filter_closed_candles(df: pd.DataFrame, timeframe: str, now: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Drop candles that are still in progress at ``now`` (UTC).
+
+    A candle is closed when ``open_time + timeframe <= now``. The ``now``
+    is captured once by the caller so a whole fetch uses one consistent
+    reference point. Download pipelines must call this so an in-progress
+    candle is never persisted as final history.
+    """
+    if df.empty:
+        return df
+    tf = parse_timeframe(timeframe)
+    now = pd.Timestamp(now) if now is not None else pd.Timestamp(datetime.now(timezone.utc))
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    return df[df.index + tf.duration <= now]
+
+
+def raw_content_hash(df: pd.DataFrame) -> str:
+    """Deterministic content hash of a canonical raw OHLCV frame.
+
+    Hashes the index (as int64 ns) and the canonical numeric columns as raw
+    float64 bytes, plus the shape, so identical datasets always produce the
+    same hash and any content change flips it. Used to prove that processed
+    artifacts were generated from the exact raw dataset they claim.
+    """
+    h = hashlib.sha256()
+    h.update(str(df.shape).encode())
+    h.update(df.index.asi8.tobytes())
+    for column in ("open", "high", "low", "close", "volume"):
+        h.update(column.encode())
+        h.update(df[column].to_numpy(dtype="float64").tobytes())
+    if "quote_volume" in df.columns:
+        h.update(b"quote_volume")
+        h.update(df["quote_volume"].to_numpy(dtype="float64").tobytes())
+    return h.hexdigest()

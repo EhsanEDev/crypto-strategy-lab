@@ -24,7 +24,7 @@ def make_ohlcv(
     open_ = close * (1 + rng.normal(0, 0.0005, n))
     high = np.maximum(open_, close) * (1 + np.abs(spread))
     low = np.minimum(open_, close) * (1 - np.abs(spread))
-    index = pd.date_range(start, periods=n, freq=freq, tz="UTC")
+    index = pd.date_range(start, periods=n, freq=freq.upper() if freq == "1d" else freq, tz="UTC")
     return pd.DataFrame(
         {
             "open": open_,

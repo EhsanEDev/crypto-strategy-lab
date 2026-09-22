@@ -1,4 +1,4 @@
-"""ATR tests against hand-computed expected values."""
+"""ATR tests against hand-computed expected values and TA-Lib ground truth."""
 
 from __future__ import annotations
 
@@ -7,6 +7,11 @@ import pandas as pd
 import pytest
 
 from crypto_strategy_lab.indicators.atr import atr, true_range
+
+try:  # optional live cross-check against the official TA-Lib
+    import talib as _talib
+except Exception:  # pragma: no cover - talib is optional
+    _talib = None
 
 
 def _frame(
@@ -65,12 +70,12 @@ def test_atr_period_3_hand_computed() -> None:
     )
     # TR = [2, 2, 2, 2, 3]
     result = atr(df, period=3, method="wilder")
-    # seed = mean(2,2,2) = 2 at idx2
-    # idx3 = (2*2 + 2)/3 = 2
-    # idx4 = (2*2 + 3)/3 = 7/3
+    # TA-Lib convention: first ATR at bar `period` = mean(TR bars 1..period)
+    # ATR[3] = mean(TR[1..3]) = 2.0
+    # ATR[4] = (ATR[3]*2 + TR[4]) / 3 = (4 + 3) / 3 = 7/3
     assert result.iloc[0] != result.iloc[0]
     assert result.iloc[1] != result.iloc[1]
-    assert result.iloc[2] == pytest.approx(2.0)
+    assert result.iloc[2] != result.iloc[2]
     assert result.iloc[3] == pytest.approx(2.0)
     assert result.iloc[4] == pytest.approx(7.0 / 3.0)
 
@@ -89,10 +94,26 @@ def test_atr_wilder_recursion_reference() -> None:
     tr = true_range(df)
     result = atr(df, period=4, method="wilder")
     expected = np.full(n, np.nan)
-    expected[3] = tr.iloc[:4].mean()
-    for i in range(4, n):
+    expected[4] = tr.iloc[1:5].mean()  # mean TR bars 1..period
+    for i in range(5, n):
         expected[i] = (expected[i - 1] * 3 + tr.iloc[i]) / 4
     assert np.allclose(result.to_numpy(), expected, atol=1e-12, equal_nan=True)
+
+
+@pytest.mark.skipif(_talib is None, reason="talib optional live cross-check")
+def test_atr_matches_talib() -> None:
+    rng = np.random.default_rng(12)
+    n = 120
+    base = 100 * np.exp(np.cumsum(rng.normal(0, 0.012, n)))
+    spread = np.abs(rng.normal(0.004, 0.002, n))
+    high = base * (1 + spread)
+    low = base * (1 - spread)
+    close = base * (1 + rng.normal(0, 0.002, n))
+    df = pd.DataFrame({"open": close, "high": high, "low": low, "close": close})
+    for period in (14, 7, 3):
+        mine = atr(df, period=period, method="wilder")
+        expected = _talib.ATR(high, low, close, timeperiod=period)
+        assert np.allclose(mine.to_numpy(), expected, atol=1e-9, equal_nan=True)
 
 
 def test_atr_warmup_is_nan() -> None:
@@ -105,7 +126,21 @@ def test_atr_warmup_is_nan() -> None:
         }
     )
     result = atr(df, period=14)
-    assert result.isna().all()
+    assert result.isna().all()  # fewer than period+1 bars
+
+def test_atr_first_valid_at_period() -> None:
+    n = 40
+    df = pd.DataFrame(
+        {
+            "open": np.full(n, 10.0),
+            "high": np.arange(10.0, 10.0 + n) + 1.0,
+            "low": np.arange(10.0, 10.0 + n) - 1.0,
+            "close": np.arange(10.0, 10.0 + n),
+        }
+    )
+    result = atr(df, period=14)
+    assert result.iloc[:14].isna().all()
+    assert result.notna().iloc[14]
 
 
 def test_atr_rejects_unknown_method() -> None:

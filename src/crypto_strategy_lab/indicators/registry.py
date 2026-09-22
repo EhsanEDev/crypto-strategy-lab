@@ -54,8 +54,9 @@ def compute_indicators(df: pd.DataFrame, config: RegimeConfig) -> pd.DataFrame:
 def warmup_bars(config: RegimeConfig) -> int:
     """Bars required before every v001 indicator is defined.
 
-    ADX needs ``2*adx_period - 2`` bars and EMA slow needs ``ema_slow - 1``
-    bars; the binding constraint wins. regime detection treats any bar
-    before this point (or with NaN indicators) as UNCERTAIN.
+    First valid positions: EMA slow at bar ``ema_slow - 1``, ADX at bar
+    ``2*adx_period - 1`` (TA-Lib convention), RSI/ATR at ``period``. The
+    binding constraint wins; regime detection treats any bar with NaN
+    indicators as UNCERTAIN.
     """
-    return max(config.ema_slow - 1, 2 * config.adx_period - 2, config.rsi_period, config.atr_period)
+    return max(config.ema_slow - 1, 2 * config.adx_period - 1, config.rsi_period, config.atr_period)

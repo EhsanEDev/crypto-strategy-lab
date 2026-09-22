@@ -7,31 +7,46 @@ Regime Detector v001 (rule-based hypothesis, no lookahead).
 - Symbol: `ETHUSDT`
 - Timeframe: `4h`
 - Start: `2022-04-17 16:00:00+00:00`
-- End: `2026-09-21 00:00:00+00:00`
-- Rows: **9705**
+- End: `2026-09-21 16:00:00+00:00`
+- Rows: **9709**
 - Missing candles (gaps): **0**
 - Duplicate candles: **0**
 - OHLC anomalies (exchange-reported inconsistencies): **29**
+- Misaligned timestamps: **0** | NaN/infinite values: **0**
+
+## Data quality
+- Quality gate: **NOT READY (strict validation failed: gaps/OHLC anomalies/misalignment)**
+- Candle policy: **closed-only** — in-progress candles are never persisted as history; the last stored candle is refreshed (replaced) on re-download if the exchange revised it.
+- OHLC anomalies are kept as received (audit trail), never silently repaired; strict validation refuses them for research use.
+
+## Provenance & freshness
+
+- Exchange: `bitunix` | market: `futures`
+- Raw range: `2022-04-17 16:00:00+00:00` → `2026-09-21 16:00:00+00:00` (9709 candles)
+- Raw content hash: `923b59ab086a9b43…`
+- Regime config fingerprint: `c2f45dc0350e`
+- Generated at: `2026-09-22T04:06:20.048628+00:00` (code v0.1.0, schema v1.0)
+- Artifact freshness: **fresh**
 
 ## Indicator summary
 
 | Indicator | Defined | NaN (warm-up) | Mean | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| EMA50 | 9656 | 49 | 2391.2925 | 1096.8064 | 4533.3665 |
-| EMA200 | 9506 | 199 | 2390.9448 | 1227.6481 | 4392.4890 |
-| ATR14 % | 9692 | 13 | 1.9911 | 0.3839 | 7.9844 |
-| RSI14 | 9691 | 14 | 50.3913 | 6.1027 | 96.2053 |
-| ADX14 | 9679 | 26 | 27.8186 | 7.8314 | 73.0014 |
+| EMA50 | 9660 | 49 | 2391.3603 | 1096.8064 | 4533.3665 |
+| EMA200 | 9510 | 199 | 2390.9538 | 1227.6481 | 4392.4890 |
+| ATR14 % | 9695 | 14 | 1.9909 | 0.3839 | 7.9844 |
+| RSI14 | 9695 | 14 | 50.4014 | 6.1027 | 96.2053 |
+| ADX14 | 9682 | 27 | 27.8238 | 7.8314 | 73.0014 |
 
-> Warm-up: EMA/ATR/RSI/ADX need history before their first defined value (EMA200 ≈ 199 bars, ADX ≈ 2×period−2 bars). Early NaNs are expected and never filled.
+> Warm-up (TA-Lib-compatible conventions): EMA slow needs `ema_slow - 1` bars, ADX needs `2*period - 1` bars (first ADX at bar 27 for period 14), RSI/ATR need `period` bars. Early NaNs are expected and never filled.
 
 ## Regime distribution
 
 | Regime | Share | Candles |
 | --- | --- | --- |
-| TREND_UP |   18.9% | 1837 |
+| TREND_UP |   19.0% | 1841 |
 | TREND_DOWN |   19.4% | 1885 |
-| RANGE |   30.0% | 2907 |
+| RANGE |   29.9% | 2907 |
 | HIGH_VOLATILITY |   10.5% | 1016 |
 | UNCERTAIN |   21.2% | 2060 |
 
@@ -72,3 +87,4 @@ Regime Detector v001 (rule-based hypothesis, no lookahead).
 
 - regime config fingerprint: `c2f45dc0350e`
 - thresholds live in `config/default.yaml` (section `regime`)
+- regenerate: `python -m crypto_strategy_lab regime --symbol ETHUSDT --timeframe 4h`
