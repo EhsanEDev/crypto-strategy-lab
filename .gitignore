@@ -18,10 +18,10 @@ venv/
 !.env.example
 
 # Project data (large binaries, reproducible via CLI)
-data/raw/
-data/processed/
-data/metadata/*.json
-data/metadata/**/*.json
+modules/research/data/raw/
+modules/research/data/processed/
+modules/research/data/metadata/*.json
+modules/research/data/metadata/**/*.json
 
 # Jupyter
 .ipynb_checkpoints/
